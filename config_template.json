@@ -21,6 +21,13 @@
         "api_secret": "YOUR_API_SECRET_HERE",
         "api_region": "eu"
     },
+    "ntfy": {
+        "enabled": true,
+        "server": "https://ntfy.sh",
+        "topic": "YOUR_SECRET_TOPIC_HERE",
+        "priority_alert": 5,
+        "priority_status": 2
+    },
     "monitoring": {
         "poll_interval_seconds": 5,
         "log_file": "agshome_events.log"

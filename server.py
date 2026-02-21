@@ -28,6 +28,8 @@ from agshome.dps_map import (
 )
 from camera import OKamCamera, CameraConfig
 
+import requests as http_requests
+
 try:
     import cv2
     CV2_AVAILABLE = True
@@ -73,6 +75,63 @@ class AppState:
 
 
 state = AppState()
+
+
+# ============================================================
+# ntfy Push Notifications
+# ============================================================
+
+_ntfy_enabled = False
+_ntfy_server = "https://ntfy.sh"
+_ntfy_topic = ""
+_ntfy_priority_alert = 5   # urgent
+_ntfy_priority_status = 2  # low
+
+
+def _load_ntfy_config():
+    """Load ntfy settings from config.json."""
+    global _ntfy_enabled, _ntfy_server, _ntfy_topic
+    global _ntfy_priority_alert, _ntfy_priority_status
+    config = load_config()
+    nc = config.get("ntfy", {})
+    _ntfy_enabled = nc.get("enabled", False)
+    _ntfy_server = nc.get("server", "https://ntfy.sh").rstrip("/")
+    _ntfy_topic = nc.get("topic", "")
+    _ntfy_priority_alert = nc.get("priority_alert", 5)
+    _ntfy_priority_status = nc.get("priority_status", 2)
+    if _ntfy_enabled and _ntfy_topic:
+        logger.info(f"ntfy enabled: {_ntfy_server}/{_ntfy_topic[:8]}...")
+    elif _ntfy_enabled:
+        logger.warning("ntfy enabled but no topic configured")
+        _ntfy_enabled = False
+
+
+def send_ntfy(message: str, title: str = "AGSHome",
+              priority: int | None = None, tags: str = ""):
+    """Send a push notification via ntfy. Non-blocking."""
+    if not _ntfy_enabled or not _ntfy_topic:
+        return
+    if priority is None:
+        priority = _ntfy_priority_status
+
+    def _send():
+        try:
+            headers = {
+                "Title": title,
+                "Priority": str(priority),
+            }
+            if tags:
+                headers["Tags"] = tags
+            http_requests.post(
+                f"{_ntfy_server}/{_ntfy_topic}",
+                data=message.encode("utf-8"),
+                headers=headers,
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"ntfy send failed: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 # ============================================================
@@ -169,7 +228,14 @@ def _monitor_loop():
                             state.last_sensor_name = event["message"]
                             state.last_sensor_time = datetime.now().strftime("%H:%M:%S")
                             state.alert_seq += 1
+                            current_mode = state.mode
                         logger.info(f"Sensor: {event['message']}")
+                        send_ntfy(
+                            f"{event['message']} ({current_mode})",
+                            title="Sensor Triggered",
+                            priority=_ntfy_priority_alert,
+                            tags="rotating_light,warning",
+                        )
                     dps = event.get("dps", {})
                     if DPS_SIREN in dps:
                         with state.lock:
@@ -200,6 +266,7 @@ def stop_monitor_thread():
 
 def connect_hub():
     """Connect to the hub (called once at startup)."""
+    _load_ntfy_config()
     config = load_config()
     hub = create_hub(config)
     if not hub:
@@ -246,6 +313,16 @@ def _stop_current_mode():
 # API Routes
 # ============================================================
 
+@app.after_request
+def add_no_cache(response):
+    """Prevent aggressive mobile browser caching."""
+    if "text/html" in response.content_type:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 @app.route("/")
 def index():
     return render_template("mobile.html")
@@ -277,6 +354,7 @@ def api_disarm():
     _stop_current_mode()
     with state.lock:
         state.mode = "disarmed"
+    send_ntfy("Alarm disarmed", tags="unlock")
     return jsonify({"ok": True, "mode": "disarmed"})
 
 
@@ -290,6 +368,7 @@ def api_away():
     state.hub.set_mode(AlarmMode.AWAY)
     with state.lock:
         state.mode = "away"
+    send_ntfy("Alarm set to AWAY", tags="lock")
     return jsonify({"ok": True, "mode": "away"})
 
 
@@ -302,6 +381,7 @@ def api_day():
     state.hub.start_monitor(muted=True, silent_rearm=False)
     with state.lock:
         state.mode = "day"
+    send_ntfy("Day monitor active", tags="eyes")
     return jsonify({"ok": True, "mode": "day"})
 
 
@@ -315,6 +395,7 @@ def api_night():
     state.hub.start_monitor(muted=False, silent_rearm=True)
     with state.lock:
         state.mode = "night"
+    send_ntfy("Night monitor active", tags="moon")
     return jsonify({"ok": True, "mode": "night"})
 
 
@@ -328,6 +409,7 @@ def api_silent_night():
     state.hub.start_monitor(muted=True, silent_rearm=True)
     with state.lock:
         state.mode = "silent_night"
+    send_ntfy("Silent night active", tags="zzz")
     return jsonify({"ok": True, "mode": "silent_night"})
 
 
@@ -395,6 +477,12 @@ def api_test_alert():
         state.last_sensor_time = datetime.now().strftime("%H:%M:%S")
         state.alert_seq += 1
     logger.info("Test alert triggered")
+    send_ntfy(
+        "Test Sensor (silent_night)",
+        title="Sensor Triggered",
+        priority=_ntfy_priority_alert,
+        tags="rotating_light,warning",
+    )
     return jsonify({"ok": True, "alert_seq": state.alert_seq})
 
 
