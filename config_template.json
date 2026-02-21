@@ -1,0 +1,28 @@
+{
+    "hub": {
+        "device_id": "YOUR_DEVICE_ID_HERE",
+        "ip_address": "YOUR_HUB_IP_HERE",
+        "local_key": "YOUR_LOCAL_KEY_HERE",
+        "protocol_version": 3.3
+    },
+    "camera": {
+        "name": "O-KAM Camera",
+        "ip_address": "YOUR_CAMERA_IP_HERE",
+        "rtsp_port": 10555,
+        "stream_path": "TCP/av0_0",
+        "sub_stream_path": "TCP/av0_1",
+        "username": "",
+        "password": "",
+        "use_sub_stream": false
+    },
+    "tuya_cloud": {
+        "_comment": "Only needed if you want cloud API access as well",
+        "api_key": "YOUR_API_KEY_HERE",
+        "api_secret": "YOUR_API_SECRET_HERE",
+        "api_region": "eu"
+    },
+    "monitoring": {
+        "poll_interval_seconds": 5,
+        "log_file": "agshome_events.log"
+    }
+}

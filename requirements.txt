@@ -1,0 +1,5 @@
+tinytuya>=1.13.0
+colorama>=0.4.6
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0

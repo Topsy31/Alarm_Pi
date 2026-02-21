@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python *)",
+      "Bash(git *)",
+      "WebFetch(domain:community.home-assistant.io)"
+    ],
+    "deny": []
+  }
+}

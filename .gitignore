@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+
+# Config with secrets
+config.json
+devices.json
+
+# TinyTuya wizard output
+tinytuya.json
+snapshot.json
+
+# Snapshots (generated at runtime)
+snapshots/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Original zip
+files.zip
