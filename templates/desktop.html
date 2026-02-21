@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+    <title>AGSHome — Desktop</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --card: #16213e;
+            --text: #e0e0e0;
+            --dim: #8892a0;
+            --accent: #00d2ff;
+            --green: #44cc44;
+            --amber: #dd8800;
+            --purple: #6644cc;
+            --yellow: #ccaa00;
+            --grey: #444466;
+            --red: #ff4444;
+            --teal: #008888;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .top-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 24px;
+            background: var(--card);
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        .top-bar h1 {
+            font-size: 1.2rem;
+            color: var(--accent);
+            letter-spacing: 0.05em;
+        }
+
+        .top-bar .status {
+            display: flex;
+            gap: 16px;
+            font-size: 0.8rem;
+        }
+
+        .status .dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            margin-right: 4px;
+            vertical-align: middle;
+        }
+        .dot.ok  { background: var(--green); }
+        .dot.off { background: var(--red); }
+
+        .main {
+            display: flex;
+            flex: 1;
+            gap: 24px;
+            padding: 24px;
+            overflow: hidden;
+        }
+
+        /* Camera panel */
+        .camera-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .camera-panel .feed {
+            flex: 1;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+
+        .camera-panel .feed img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .camera-panel .feed .no-cam {
+            color: var(--dim);
+            font-size: 1rem;
+        }
+
+        /* Control panel */
+        .control-panel {
+            width: 300px;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .mode-badge {
+            font-size: 1.4rem;
+            font-weight: 700;
+            padding: 14px 20px;
+            border-radius: 12px;
+            background: var(--card);
+            text-align: center;
+            transition: color 0.2s;
+        }
+
+        .buttons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        .btn {
+            padding: 16px 10px;
+            border: 3px solid transparent;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            color: white;
+            cursor: pointer;
+            transition: border-color 0.15s, transform 0.1s, opacity 0.1s;
+            text-align: center;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn:active { transform: scale(0.97); }
+        .btn.active { border-color: var(--accent); box-shadow: 0 0 12px rgba(0, 210, 255, 0.25); }
+        .btn:disabled { opacity: 0.4; cursor: default; transform: none; }
+
+        .btn-disarm  { background: var(--green); grid-column: span 2; }
+        .btn-away    { background: var(--red); grid-column: span 2; }
+        .btn-day     { background: var(--amber); }
+        .btn-night   { background: var(--purple); }
+        .btn-silent  { background: var(--teal); grid-column: span 2; }
+        .btn-nl      { background: var(--grey); grid-column: span 2; }
+        .btn-nl.on   { background: var(--yellow); }
+
+        .sensor {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 14px 18px;
+            text-align: center;
+        }
+        .sensor .label { font-size: 0.7rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em; }
+        .sensor .name  { font-size: 1rem; color: var(--accent); margin-top: 4px; }
+        .sensor .time  { font-size: 0.7rem; color: var(--dim); margin-top: 2px; }
+
+        .link-mobile {
+            text-align: center;
+            margin-top: auto;
+            padding-top: 12px;
+        }
+        .link-mobile a {
+            color: var(--dim);
+            font-size: 0.75rem;
+            text-decoration: none;
+        }
+        .link-mobile a:hover { color: var(--accent); }
+    </style>
+</head>
+<body>
+    <div class="top-bar">
+        <h1>AGSHome</h1>
+        <div class="status">
+            <span><span class="dot off" id="hubDot"></span> Hub: <span id="hubStatus">--</span></span>
+            <span><span class="dot off" id="camDot"></span> Camera: <span id="camStatus">--</span></span>
+        </div>
+    </div>
+
+    <div class="main">
+        <div class="camera-panel">
+            <div class="feed">
+                <img id="camFeed" src="" alt="Camera" style="display:none;">
+                <div class="no-cam" id="noCam">Camera not connected</div>
+            </div>
+        </div>
+
+        <div class="control-panel">
+            <div class="mode-badge" id="mode">---</div>
+
+            <div class="buttons">
+                <button class="btn btn-disarm" id="bDisarm" onclick="cmd('disarm')">DISARM</button>
+                <button class="btn btn-away"   id="bAway"   onclick="cmd('away')">AWAY</button>
+                <button class="btn btn-day"    id="bDay"    onclick="cmd('day')">DAY</button>
+                <button class="btn btn-night"  id="bNight"  onclick="cmd('night')">NIGHT</button>
+                <button class="btn btn-silent" id="bSilent" onclick="cmd('silent_night')">SILENT NIGHT</button>
+                <button class="btn btn-nl"     id="bNL"     onclick="cmd('nightlight')">NIGHT LIGHT</button>
+            </div>
+
+            <div class="sensor">
+                <div class="label">Last Sensor</div>
+                <div class="name" id="sName">--</div>
+                <div class="time" id="sTime"></div>
+            </div>
+
+            <div class="link-mobile">
+                <a href="/">Open mobile view</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const LABELS = { disarmed: "DISARMED", away: "AWAY", day: "DAY MONITOR", night: "NIGHT MONITOR", silent_night: "SILENT NIGHT" };
+        const COLOURS = { disarmed: "#44cc44", away: "#ff4444", day: "#dd8800", night: "#6644cc", silent_night: "#008888" };
+        let busy = false;
+
+        async function cmd(action) {
+            if (busy) return;
+            busy = true;
+            document.querySelectorAll(".btn").forEach(b => b.disabled = true);
+            try {
+                const r = await fetch("/api/" + action, { method: "POST" });
+                if (!r.ok) console.error(await r.text());
+                await poll();
+            } catch (e) {
+                console.error(e);
+            } finally {
+                busy = false;
+                document.querySelectorAll(".btn").forEach(b => b.disabled = false);
+            }
+        }
+
+        async function poll() {
+            try {
+                const r = await fetch("/api/status");
+                const d = await r.json();
+                render(d);
+            } catch {
+                document.getElementById("hubStatus").textContent = "offline";
+            }
+        }
+
+        function render(d) {
+            // Hub status
+            const hubDot = document.getElementById("hubDot");
+            hubDot.className = "dot " + (d.hub_connected ? "ok" : "off");
+            document.getElementById("hubStatus").textContent = d.hub_connected ? "connected" : "disconnected";
+
+            // Camera status
+            const camDot = document.getElementById("camDot");
+            camDot.className = "dot " + (d.camera_connected ? "ok" : "off");
+            document.getElementById("camStatus").textContent = d.camera_connected ? "streaming" : "disconnected";
+
+            // Camera feed
+            const feed = document.getElementById("camFeed");
+            const noCam = document.getElementById("noCam");
+            if (d.camera_connected && !feed.src.includes("/api/camera/stream")) {
+                feed.src = "/api/camera/stream";
+                feed.style.display = "";
+                noCam.style.display = "none";
+            } else if (!d.camera_connected) {
+                feed.src = "";
+                feed.style.display = "none";
+                noCam.style.display = "";
+            }
+
+            // Mode
+            const mode = document.getElementById("mode");
+            mode.textContent = LABELS[d.mode] || d.mode;
+            mode.style.color = COLOURS[d.mode] || "#e0e0e0";
+
+            document.getElementById("bDisarm").classList.toggle("active", d.mode === "disarmed");
+            document.getElementById("bAway").classList.toggle("active", d.mode === "away");
+            document.getElementById("bDay").classList.toggle("active", d.mode === "day");
+            document.getElementById("bNight").classList.toggle("active", d.mode === "night");
+            document.getElementById("bSilent").classList.toggle("active", d.mode === "silent_night");
+
+            const nl = document.getElementById("bNL");
+            nl.classList.toggle("on", d.night_light);
+            nl.textContent = d.night_light ? "NIGHT LIGHT (ON)" : "NIGHT LIGHT";
+
+            if (d.last_sensor_name) {
+                document.getElementById("sName").textContent = d.last_sensor_name;
+                document.getElementById("sTime").textContent = d.last_sensor_time || "";
+            }
+        }
+
+        setInterval(poll, 1500);
+        poll();
+    </script>
+</body>
+</html>

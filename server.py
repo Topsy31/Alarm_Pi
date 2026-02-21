@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, Response
 
 from agshome.hub import AGSHomeHub
 from agshome.dps_map import (
@@ -26,6 +26,13 @@ from agshome.dps_map import (
     DPS_SIREN, DPS_VOLUME,
     decode_utf16_base64,
 )
+from camera import OKamCamera, CameraConfig
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +66,8 @@ class AppState:
         self.last_sensor_time = ""
         self.alert_seq = 0  # incremented on each sensor trigger
         self.hub: Optional[AGSHomeHub] = None
+        self.camera: Optional[OKamCamera] = None
+        self.camera_connected = False
         self._monitor_running = False
         self._monitor_thread: Optional[threading.Thread] = None
 
@@ -103,6 +112,45 @@ def create_hub(config: dict) -> Optional[AGSHomeHub]:
         local_key=hc["local_key"],
         version=hc.get("protocol_version", 3.4),
     )
+
+
+def create_camera(config: dict) -> Optional[OKamCamera]:
+    """Create camera instance from config."""
+    cc = config.get("camera", {})
+    if not cc.get("ip_address") or cc["ip_address"].startswith("YOUR"):
+        return None
+    cam_config = CameraConfig(
+        name=cc.get("name", "O-KAM Camera"),
+        ip_address=cc["ip_address"],
+        rtsp_port=cc.get("rtsp_port", 10555),
+        stream_path=cc.get("stream_path", "TCP/av0_0"),
+        sub_stream_path=cc.get("sub_stream_path", "TCP/av0_1"),
+        use_sub_stream=cc.get("use_sub_stream", False),
+        username=cc.get("username", ""),
+        password=cc.get("password", ""),
+    )
+    return OKamCamera(cam_config)
+
+
+def connect_camera():
+    """Connect to the camera (called once at startup)."""
+    if not CV2_AVAILABLE:
+        logger.warning("OpenCV not available — camera disabled")
+        return
+    config = load_config()
+    camera = create_camera(config)
+    if not camera:
+        logger.info("No camera configured (check config.json)")
+        return
+
+    logger.info(f"Connecting to camera at {camera.config.ip_address}...")
+    if camera.connect():
+        camera.start_stream(display=False, fps_limit=15.0)
+        state.camera = camera
+        state.camera_connected = True
+        logger.info(f"Camera connected at {camera.config.ip_address}")
+    else:
+        logger.error("Camera connection failed")
 
 
 # ============================================================
@@ -203,6 +251,11 @@ def index():
     return render_template("mobile.html")
 
 
+@app.route("/desktop")
+def desktop():
+    return render_template("desktop.html")
+
+
 @app.route("/api/status")
 def api_status():
     with state.lock:
@@ -210,6 +263,7 @@ def api_status():
             "mode": state.mode,
             "night_light": state.night_light,
             "hub_connected": state.hub_connected,
+            "camera_connected": state.camera_connected,
             "last_sensor_name": state.last_sensor_name,
             "last_sensor_time": state.last_sensor_time,
             "alert_seq": state.alert_seq,
@@ -288,6 +342,49 @@ def api_nightlight():
     return jsonify({"ok": True, "night_light": new_state})
 
 
+@app.route("/api/camera/stream")
+def api_camera_stream():
+    """MJPEG stream from the camera for the desktop view."""
+    if not state.camera_connected or not state.camera:
+        return "Camera not connected", 503
+
+    def generate():
+        while True:
+            frame = state.camera.get_latest_frame()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if not ret:
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n"
+                + jpeg.tobytes()
+                + b"\r\n"
+            )
+            time.sleep(0.066)  # ~15 fps
+
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/api/camera/snapshot")
+def api_camera_snapshot():
+    """Single JPEG frame from the camera."""
+    if not state.camera_connected or not state.camera:
+        return "Camera not connected", 503
+    frame = state.camera.get_latest_frame()
+    if frame is None:
+        return "No frame available", 503
+    ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ret:
+        return "Encoding failed", 500
+    return Response(jpeg.tobytes(), mimetype="image/jpeg")
+
+
 @app.route("/api/test_alert", methods=["POST"])
 def api_test_alert():
     """Simulate a sensor trigger for testing phone alerts.
@@ -307,9 +404,11 @@ def api_test_alert():
 
 if __name__ == "__main__":
     connect_hub()
+    connect_camera()
     start_monitor_thread()
     local_ip = get_local_ip()
-    print(f"\n  Open on phone: http://agshome.local:5000")
+    print(f"\n  Phone:   http://agshome.local:5000")
+    print(f"  Desktop: http://agshome.local:5000/desktop")
     print(f"  (or by IP: http://{local_ip}:5000)\n")
     try:
         app.run(host="0.0.0.0", port=5000, debug=False)
@@ -317,6 +416,8 @@ if __name__ == "__main__":
         pass
     finally:
         stop_monitor_thread()
+        if state.camera:
+            state.camera.disconnect()
         if state.hub:
             if state.hub.monitor_active:
                 state.hub.stop_monitor()

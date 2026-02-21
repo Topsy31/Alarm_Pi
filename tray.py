@@ -32,7 +32,7 @@ from pystray import MenuItem, Menu
 from zeroconf import ServiceInfo, Zeroconf
 
 from server import (
-    app, state, connect_hub, start_monitor_thread,
+    app, state, connect_hub, connect_camera, start_monitor_thread,
     stop_monitor_thread, get_local_ip,
 )
 
@@ -75,6 +75,8 @@ def on_quit(icon, item):
     logger.info("Shutting down...")
     _unregister_mdns()
     stop_monitor_thread()
+    if state.camera:
+        state.camera.disconnect()
     if state.hub:
         if state.hub.monitor_active:
             state.hub.stop_monitor()
@@ -161,6 +163,7 @@ def setup(icon):
     def _startup():
         _register_mdns()
         connect_hub()
+        connect_camera()
         if state.hub_connected:
             icon.icon = create_icon(connected=True)
             icon.title = f"AGSHome — connected ({state.hub.ip_address})"
