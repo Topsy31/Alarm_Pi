@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
+    <title>AGSHome</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --card: #16213e;
+            --text: #e0e0e0;
+            --dim: #8892a0;
+            --accent: #00d2ff;
+            --green: #44cc44;
+            --amber: #dd8800;
+            --purple: #6644cc;
+            --yellow: #ccaa00;
+            --grey: #444466;
+            --red: #ff4444;
+            --teal: #008888;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 24px 16px;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 24px;
+        }
+
+        .header h1 {
+            font-size: 1.3rem;
+            color: var(--accent);
+            letter-spacing: 0.05em;
+        }
+
+        .conn {
+            font-size: 0.8rem;
+            color: var(--dim);
+            margin-top: 4px;
+        }
+        .conn.ok { color: var(--green); }
+        .conn.fail { color: var(--red); }
+
+        .mode-badge {
+            font-size: 1.5rem;
+            font-weight: 700;
+            padding: 14px 24px;
+            border-radius: 14px;
+            background: var(--card);
+            text-align: center;
+            width: 100%;
+            max-width: 340px;
+            margin-bottom: 24px;
+            transition: color 0.2s;
+        }
+
+        .buttons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            width: 100%;
+            max-width: 340px;
+            margin-bottom: 28px;
+        }
+
+        .btn {
+            padding: 22px 12px;
+            border: 3px solid transparent;
+            border-radius: 16px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: white;
+            cursor: pointer;
+            transition: border-color 0.15s, transform 0.1s, opacity 0.1s;
+            -webkit-user-select: none;
+            user-select: none;
+            text-align: center;
+        }
+        .btn:active { transform: scale(0.95); opacity: 0.8; }
+        .btn.active { border-color: var(--accent); box-shadow: 0 0 16px rgba(0, 210, 255, 0.25); }
+        .btn:disabled { opacity: 0.4; cursor: default; transform: none; }
+
+        .btn-disarm  { background: var(--green); grid-column: span 2; }
+        .btn-away    { background: var(--red); grid-column: span 2; }
+        .btn-day     { background: var(--amber); }
+        .btn-night   { background: var(--purple); }
+        .btn-silent  { background: var(--teal); grid-column: span 2; }
+        .btn-nl      { background: var(--grey); grid-column: span 2; }
+        .btn-nl.on   { background: var(--yellow); }
+
+        .sensor {
+            background: var(--card);
+            border-radius: 14px;
+            padding: 16px 20px;
+            width: 100%;
+            max-width: 340px;
+            text-align: center;
+        }
+        .sensor .label { font-size: 0.75rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em; }
+        .sensor .name  { font-size: 1.05rem; color: var(--accent); margin-top: 4px; }
+        .sensor .time  { font-size: 0.75rem; color: var(--dim); margin-top: 2px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>AGSHome</h1>
+        <div class="conn" id="conn">connecting...</div>
+    </div>
+
+    <div class="mode-badge" id="mode">---</div>
+
+    <div class="buttons">
+        <button class="btn btn-disarm" id="bDisarm" onclick="cmd('disarm')">DISARM</button>
+        <button class="btn btn-away"   id="bAway"   onclick="cmd('away')">AWAY</button>
+        <button class="btn btn-day"    id="bDay"    onclick="cmd('day')">DAY</button>
+        <button class="btn btn-night"  id="bNight"  onclick="cmd('night')">NIGHT</button>
+        <button class="btn btn-silent" id="bSilent" onclick="cmd('silent_night')">SILENT NIGHT</button>
+        <button class="btn btn-nl"     id="bNL"     onclick="cmd('nightlight')">NIGHT LIGHT</button>
+    </div>
+
+    <div class="sensor">
+        <div class="label">Last Sensor</div>
+        <div class="name" id="sName">--</div>
+        <div class="time" id="sTime"></div>
+    </div>
+
+    <script>
+        const LABELS = { disarmed: "DISARMED", away: "AWAY", day: "DAY MONITOR", night: "NIGHT MONITOR", silent_night: "SILENT NIGHT" };
+        const COLOURS = { disarmed: "#44cc44", away: "#ff4444", day: "#dd8800", night: "#6644cc", silent_night: "#008888" };
+        let busy = false;
+        let lastAlertSeq = -1;  // tracks server alert_seq to detect new triggers
+
+        async function cmd(action) {
+            if (busy) return;
+            busy = true;
+            setBusy(true);
+            try {
+                const r = await fetch("/api/" + action, { method: "POST" });
+                if (!r.ok) console.error(await r.text());
+                await poll();
+            } catch (e) {
+                console.error(e);
+            } finally {
+                busy = false;
+                setBusy(false);
+            }
+        }
+
+        function setBusy(on) {
+            document.querySelectorAll(".btn").forEach(b => b.disabled = on);
+        }
+
+        async function poll() {
+            try {
+                const r = await fetch("/api/status");
+                const d = await r.json();
+                render(d);
+            } catch {
+                document.getElementById("conn").textContent = "offline";
+                document.getElementById("conn").className = "conn fail";
+            }
+        }
+
+        function render(d) {
+            const conn = document.getElementById("conn");
+            conn.textContent = d.hub_connected ? "connected" : "disconnected";
+            conn.className = "conn " + (d.hub_connected ? "ok" : "fail");
+
+            const mode = document.getElementById("mode");
+            mode.textContent = LABELS[d.mode] || d.mode;
+            mode.style.color = COLOURS[d.mode] || "#e0e0e0";
+
+            document.getElementById("bDisarm").classList.toggle("active", d.mode === "disarmed");
+            document.getElementById("bAway").classList.toggle("active", d.mode === "away");
+            document.getElementById("bDay").classList.toggle("active", d.mode === "day");
+            document.getElementById("bNight").classList.toggle("active", d.mode === "night");
+            document.getElementById("bSilent").classList.toggle("active", d.mode === "silent_night");
+
+            const nl = document.getElementById("bNL");
+            nl.classList.toggle("on", d.night_light);
+            nl.textContent = d.night_light ? "NIGHT LIGHT (ON)" : "NIGHT LIGHT";
+
+            if (d.last_sensor_name) {
+                document.getElementById("sName").textContent = d.last_sensor_name;
+                document.getElementById("sTime").textContent = d.last_sensor_time || "";
+            }
+
+            // Vibrate + notify on new sensor trigger in silent_night mode
+            if (d.alert_seq !== undefined && lastAlertSeq >= 0
+                && d.alert_seq > lastAlertSeq && d.mode === "silent_night") {
+                triggerPhoneAlert(d.last_sensor_name);
+            }
+            if (d.alert_seq !== undefined) lastAlertSeq = d.alert_seq;
+        }
+
+        // Audio context for alert tone (works without user gesture from timers)
+        let audioCtx = null;
+        function ensureAudio() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            return audioCtx;
+        }
+
+        function playAlertTone() {
+            try {
+                const ctx = ensureAudio();
+                // Three short beeps
+                [0, 0.25, 0.5].forEach(offset => {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.frequency.value = 880;
+                    osc.type = "square";
+                    gain.gain.value = 0.3;
+                    osc.start(ctx.currentTime + offset);
+                    osc.stop(ctx.currentTime + offset + 0.15);
+                });
+            } catch (e) {
+                console.warn("Audio alert failed:", e);
+            }
+        }
+
+        function triggerPhoneAlert(sensor) {
+            // Audio beep (works from timer callbacks)
+            playAlertTone();
+            // Vibrate (best-effort — may be blocked without user gesture)
+            if (navigator.vibrate) {
+                navigator.vibrate([400, 200, 400, 200, 400]);
+            }
+            // Browser notification
+            if ("Notification" in window && Notification.permission === "granted") {
+                new Notification("AGSHome — Sensor triggered", {
+                    body: sensor,
+                    icon: "/static/icon-192.png",
+                    tag: "agshome-alert",  // replaces previous, avoids stacking
+                    renotify: true,
+                });
+            }
+            // Visual flash
+            document.body.style.background = "#ff4444";
+            setTimeout(() => { document.body.style.background = ""; }, 300);
+            setTimeout(() => { document.body.style.background = "#ff4444"; }, 600);
+            setTimeout(() => { document.body.style.background = ""; }, 900);
+        }
+
+        // Unlock audio context + request notification permission on first tap
+        document.addEventListener("click", function initPerms() {
+            ensureAudio();
+            if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+            if ("Notification" in window && Notification.permission === "default") {
+                Notification.requestPermission();
+            }
+            document.removeEventListener("click", initPerms);
+        }, { once: true });
+
+        setInterval(poll, 1500);
+        poll();
+    </script>
+</body>
+</html>

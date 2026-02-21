@@ -248,6 +248,7 @@ class AGSHomeHub:
         if not hasattr(self, "_monitor_active"):
             self._monitor_active = False
             self._monitor_muted = False
+            self._monitor_silent_rearm = True
             self._monitor_saved_volume: Optional[str] = None
             self._monitor_rearming = False
             self._monitor_listeners: list[Callable] = []
@@ -283,19 +284,22 @@ class AGSHomeHub:
             except Exception as e:
                 logger.error(f"Monitor listener error: {e}")
 
-    def start_monitor(self, muted: bool = False):
+    def start_monitor(self, muted: bool = False, silent_rearm: bool = True):
         """
         Enter monitor mode.
 
-        Sets the hub to HOME mode so sensors are active, then silently
+        Sets the hub to HOME mode so sensors are active, then
         monitors all events. When a sensor triggers:
           1. Immediately silences the siren
           2. Logs the sensor event
           3. Re-arms to HOME mode
 
         Args:
-            muted: If True, set volume to mute before arming (day monitor).
+            muted: If True, set volume to mute before arming.
                    Volume is restored when monitor mode exits.
+            silent_rearm: If True (default), re-arm using direct DPS writes
+                   (no beeps). If False, use normal disarm/re-arm cycle
+                   (hub beeps on arm — useful for daytime awareness).
 
         Call stop_monitor() to exit.
         """
@@ -306,6 +310,7 @@ class AGSHomeHub:
 
         self._monitor_active = True
         self._monitor_muted = muted
+        self._monitor_silent_rearm = silent_rearm
 
         # If muted, save current volume and set to mute
         if muted:
@@ -404,35 +409,44 @@ class AGSHomeHub:
         return events
 
     def _monitor_rearm_sequence(self):
-        """Background thread: silence siren, clear trigger, re-enable zones.
+        """Background thread: silence siren, clear trigger, re-arm.
 
-        Uses direct DPS writes to avoid mode changes, which eliminates
-        the arm/disarm beeps from the hub.
+        Uses either silent re-arm (direct DPS writes, no beeps) or normal
+        re-arm (disarm/re-arm cycle, hub beeps) depending on the
+        silent_rearm flag set in start_monitor().
         """
         self._monitor_rearming = True
         try:
-            # 1. Silence siren / night light
+            # 1. Silence siren
             logger.info("Monitor: silencing siren...")
             self.trigger_siren(False)
             self._notify_monitor("silence", "Siren silenced")
 
             time.sleep(0.3)
 
-            # 2. Clear the trigger flag directly (no mode change = no beep)
-            logger.info("Monitor: clearing trigger...")
-            self._set_dps(DPS_ALARM_TRIGGERED, False)
+            if self._monitor_silent_rearm:
+                # SILENT re-arm: direct DPS writes (no mode change = no beep)
+                logger.info("Monitor: clearing trigger (silent)...")
+                self._set_dps(DPS_ALARM_TRIGGERED, False)
+                time.sleep(0.3)
 
-            time.sleep(0.3)
+                if self._monitor_active:
+                    logger.info("Monitor: re-enabling zones...")
+                    self._set_dps(DPS_ZONE_1_ENABLED, True)
+                    time.sleep(0.2)
+                    self._set_dps(DPS_ZONE_2_ENABLED, True)
+                    self._notify_monitor("rearm", "Re-armed (silent)")
+                    logger.info("Monitor: re-arm complete (silent)")
+            else:
+                # NORMAL re-arm: disarm then re-arm (hub beeps — wanted)
+                logger.info("Monitor: normal disarm/re-arm cycle...")
+                self.set_mode(AlarmMode.DISARMED)
+                time.sleep(1.0)
 
-            # 3. Re-enable zones (trigger disables them)
-            if self._monitor_active:
-                logger.info("Monitor: re-enabling zones...")
-                self._set_dps(DPS_ZONE_1_ENABLED, True)
-                time.sleep(0.2)
-                self._set_dps(DPS_ZONE_2_ENABLED, True)
-
-                self._notify_monitor("rearm", "Re-armed (silent)")
-                logger.info("Monitor: re-arm sequence complete (silent)")
+                if self._monitor_active:
+                    self.set_mode(AlarmMode.HOME)
+                    self._notify_monitor("rearm", "Re-armed")
+                    logger.info("Monitor: re-arm complete (normal)")
         except Exception as e:
             logger.error(f"Monitor re-arm error: {e}")
         finally:
