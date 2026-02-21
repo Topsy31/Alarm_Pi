@@ -27,6 +27,8 @@ DPS_ZONE_1_ENABLED = "111"    # Zone 1 enabled (bool)
 DPS_ZONE_2_ENABLED = "112"    # Zone 2 enabled (bool)
 DPS_ZONE_1_SENSITIVITY = "113"  # Zone 1 sensitivity (int)
 DPS_ZONE_2_SENSITIVITY = "114"  # Zone 2 sensitivity (int)
+DPS_SENSOR_EVENT = "116"        # Sensor event (base64-encoded UTF-16 string, e.g. "Office Window Alarm")
+DPS_NOTIFICATION = "121"        # Status notification (base64-encoded UTF-16 string, e.g. "Disarm")
 
 # Map of all known DPS indices to human-readable names
 DPS_NAMES = {
@@ -40,6 +42,8 @@ DPS_NAMES = {
     DPS_ZONE_2_ENABLED: "Zone 2 Enabled",
     DPS_ZONE_1_SENSITIVITY: "Zone 1 Sensitivity",
     DPS_ZONE_2_SENSITIVITY: "Zone 2 Sensitivity",
+    DPS_SENSOR_EVENT: "Sensor Event",
+    DPS_NOTIFICATION: "Notification",
 }
 
 # Mode display labels
@@ -48,6 +52,16 @@ MODE_LABELS = {
     AlarmMode.HOME: "HOME",
     AlarmMode.AWAY: "AWAY",
 }
+
+
+def decode_utf16_base64(value: str) -> str:
+    """Decode a base64-encoded UTF-16 string from the hub."""
+    import base64
+    try:
+        raw = base64.b64decode(value)
+        return raw.decode("utf-16-be").strip("\x00")
+    except Exception:
+        return value
 
 
 def describe_dps(index: str, value) -> str:
@@ -60,6 +74,10 @@ def describe_dps(index: str, value) -> str:
             return f"{name}: {MODE_LABELS[mode]}"
         except ValueError:
             pass
+
+    if str(index) in (DPS_SENSOR_EVENT, DPS_NOTIFICATION):
+        decoded = decode_utf16_base64(str(value))
+        return f"{name}: {decoded}"
 
     if isinstance(value, bool):
         return f"{name}: {'ON' if value else 'OFF'}"
