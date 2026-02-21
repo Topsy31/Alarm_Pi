@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-dashboard.py - Unified security dashboard for AGSHome hub + O-KAM camera.
+dashboard.py — AGSHome alarm hub dashboard.
 
-Combines alarm status monitoring with live camera feed in a single
-tkinter GUI window. Features:
+Tkinter GUI for monitoring and controlling the AGSHome alarm hub
+over the local network. Features:
 
-  - Live camera feed with motion detection overlay
-  - Alarm status panel with arm/disarm controls
-  - Sensor state indicators
-  - Event log with timestamps
-  - Snapshot-on-alarm: auto-captures camera frame when alarm triggers
+  - Live alarm status display (away / home / disarmed)
+  - Arm/disarm control buttons
+  - Sensor event feed with decoded sensor names
+  - Hub settings display (zones, volume, delay)
+  - Headless mode for background monitoring
 
 Usage:
     python dashboard.py                 # Launch GUI dashboard
@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,9 +35,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_FILE = "config.json"
 DEVICES_FILE = "devices.json"
-SNAPSHOT_DIR = "snapshots"
 
-# Try importing GUI and camera dependencies
 try:
     import tkinter as tk
     from tkinter import ttk, scrolledtext
@@ -45,17 +43,15 @@ try:
 except ImportError:
     TK_AVAILABLE = False
 
-try:
-    import cv2
-    import numpy as np
-    from PIL import Image, ImageTk
-    CAMERA_AVAILABLE = True
-except ImportError:
-    CAMERA_AVAILABLE = False
-
 from agshome.hub import AGSHomeHub
-from agshome.dps_map import AlarmMode
-from agshome.camera import OKamCamera, CameraConfig
+from agshome.dps_map import (
+    AlarmMode, VolumeLevel, MODE_LABELS, VOLUME_LABELS,
+    DPS_ALARM_MODE, DPS_ALARM_TRIGGERED, DPS_SIREN,
+    DPS_ALARM_DURATION, DPS_ALARM_TONE, DPS_VOLUME,
+    DPS_ZONE_1_ENABLED, DPS_ZONE_2_ENABLED,
+    DPS_SENSOR_EVENT, DPS_NOTIFICATION,
+    describe_dps, decode_utf16_base64,
+)
 
 
 def load_config() -> dict:
@@ -67,10 +63,10 @@ def load_config() -> dict:
 
 
 def create_hub(config: dict) -> Optional[AGSHomeHub]:
-    """Create and connect to the alarm hub."""
+    """Create the alarm hub instance from config."""
     hc = config.get("hub", {})
     if not hc.get("device_id") or hc["device_id"].startswith("YOUR"):
-        # Try devices.json fallback
+        # Fallback to devices.json
         if os.path.exists(DEVICES_FILE):
             with open(DEVICES_FILE) as f:
                 devices = json.load(f)
@@ -80,281 +76,385 @@ def create_hub(config: dict) -> Optional[AGSHomeHub]:
                     "device_id": d["id"],
                     "ip_address": d.get("ip", ""),
                     "local_key": d["key"],
-                    "protocol_version": float(d.get("version", 3.3)),
+                    "protocol_version": float(d.get("version", 3.4)),
                 }
 
     if not hc.get("device_id"):
         return None
 
-    hub = AGSHomeHub(
+    return AGSHomeHub(
         device_id=hc["device_id"],
         ip_address=hc["ip_address"],
         local_key=hc["local_key"],
-        version=hc.get("protocol_version", 3.3),
+        version=hc.get("protocol_version", 3.4),
     )
-    return hub
-
-
-def create_camera(config: dict) -> Optional[OKamCamera]:
-    """Create and configure the camera."""
-    cc = config.get("camera", {})
-    if not cc.get("ip_address"):
-        return None
-
-    cam_config = CameraConfig(
-        name=cc.get("name", "O-KAM Camera"),
-        ip_address=cc["ip_address"],
-        rtsp_port=cc.get("rtsp_port", 10555),
-        username=cc.get("username", ""),
-        password=cc.get("password", ""),
-        stream_path=cc.get("stream_path", "TCP/av0_0"),
-        sub_stream_path=cc.get("sub_stream_path", "TCP/av0_1"),
-        use_sub_stream=cc.get("use_sub_stream", False),
-    )
-    return OKamCamera(cam_config)
 
 
 # ============================================================
-# Headless Mode (no GUI - just logging)
+# Headless Mode
 # ============================================================
 
-def run_headless(hub: Optional[AGSHomeHub], camera: Optional[OKamCamera]):
-    """Run in headless mode - monitor and log events."""
-    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-
-    if hub:
-        if hub.connect():
-            logger.info("Hub connected")
-        else:
-            logger.error("Hub connection failed")
-            hub = None
-
-    if camera:
-        if camera.connect():
-            logger.info("Camera connected")
-        else:
-            logger.error("Camera connection failed")
-            camera = None
-
-    if not hub and not camera:
-        logger.error("No devices connected. Exiting.")
+def run_headless(hub: AGSHomeHub):
+    """Run in headless mode — monitor and log events."""
+    if hub.connect():
+        logger.info("Hub connected")
+    else:
+        logger.error("Hub connection failed")
         return
 
-    def on_alarm_change(dps_index, new_value, old_value):
-        logger.info(f"ALARM DPS {dps_index}: {old_value} -> {new_value}")
-        # Auto-snapshot on alarm trigger
-        if camera and camera.is_connected():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(SNAPSHOT_DIR, f"alarm_{timestamp}.jpg")
-            camera.snapshot(save_path=path)
-            logger.info(f"Alarm snapshot saved: {path}")
+    def on_change(idx, new_val, old_val):
+        desc = describe_dps(idx, new_val)
+        logger.info(f"CHANGE: {desc} (was: {old_val})")
 
-    def on_motion(score, frame):
-        if score > 15:  # Significant motion
-            logger.info(f"Motion detected! Score: {score:.1f}")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(SNAPSHOT_DIR, f"motion_{timestamp}.jpg")
-            cv2.imwrite(path, frame)
-
-    if hub:
-        hub.add_listener(on_alarm_change)
-
-    if camera:
-        camera.add_motion_listener(on_motion)
-        camera.start_stream(display=False, fps_limit=5)
-
+    hub.add_listener(on_change)
     logger.info("Monitoring started (Ctrl+C to stop)...")
 
     try:
-        if hub:
-            hub.poll_loop(interval=5.0)
-        else:
-            # Camera only - just wait
-            while True:
-                time.sleep(1)
+        hub.poll_loop(interval=5.0)
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     finally:
-        if camera:
-            camera.disconnect()
-        if hub:
-            hub.disconnect()
+        hub.disconnect()
 
 
 # ============================================================
 # GUI Dashboard
 # ============================================================
 
+# Colour scheme
+BG_DARK = "#1a1a2e"
+BG_PANEL = "#16213e"
+BG_CARD = "#0f3460"
+FG_TEXT = "#e0e0e0"
+FG_DIM = "#8892a0"
+FG_ACCENT = "#00d2ff"
+COL_ARMED = "#ff4444"
+COL_HOME = "#ffaa00"
+COL_DISARMED = "#44cc44"
+COL_TRIGGERED = "#ff0000"
+COL_SENSOR = "#ff6600"
+COL_MONITOR = "#6644cc"
+
+
 class SecurityDashboard:
-    """Tkinter-based security dashboard combining alarm + camera."""
+    """Tkinter-based alarm hub dashboard."""
 
-    POLL_INTERVAL_MS = 3000      # Alarm status poll interval
-    CAMERA_FRAME_MS = 66         # ~15 FPS camera update
-    CAMERA_DISPLAY_WIDTH = 640
-    CAMERA_DISPLAY_HEIGHT = 480
+    POLL_INTERVAL_MS = 2000
+    ASYNC_CHECK_MS = 500
 
-    def __init__(self, hub: Optional[AGSHomeHub], camera: Optional[OKamCamera]):
+    # Known sensors (from user)
+    SENSORS = [
+        "Livingroom Door",
+        "Livingroom Window",
+        "Office Window",
+        "Side Door",
+        "Kitchen Door",
+    ]
+
+    def __init__(self, hub: AGSHomeHub):
         self.hub = hub
-        self.camera = camera
         self.running = False
         self._hub_connected = False
-        self._camera_connected = False
-        self._last_hub_status = {}
-
-        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        self._last_status = {}
         self._build_gui()
 
     def _build_gui(self):
         """Build the main GUI window."""
         self.root = tk.Tk()
         self.root.title("AGSHome Security Dashboard")
-        self.root.geometry("1000x700")
-        self.root.configure(bg="#1e1e2e")
+        self.root.geometry("750x600")
+        self.root.minsize(650, 500)
+        self.root.configure(bg=BG_DARK)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # --- Main layout: left (camera) + right (controls) ---
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # --- Top: Alarm mode banner ---
+        self.mode_frame = tk.Frame(self.root, bg=COL_DISARMED, height=70)
+        self.mode_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+        self.mode_frame.pack_propagate(False)
 
-        # Left: Camera feed
-        left_frame = ttk.LabelFrame(main_frame, text="Camera Feed")
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        self.mode_label = tk.Label(
+            self.mode_frame, text="CONNECTING...",
+            font=("Helvetica", 24, "bold"), fg="white", bg=COL_DISARMED,
+        )
+        self.mode_label.pack(expand=True)
 
-        self.camera_label = ttk.Label(left_frame, text="No camera connected")
-        self.camera_label.pack(fill=tk.BOTH, expand=True)
+        self.triggered_label = tk.Label(
+            self.mode_frame, text="",
+            font=("Helvetica", 11), fg="white", bg=COL_DISARMED,
+        )
+        self.triggered_label.pack()
 
-        cam_btn_frame = ttk.Frame(left_frame)
-        cam_btn_frame.pack(fill=tk.X, pady=5)
-        ttk.Button(cam_btn_frame, text="📸 Snapshot",
-                   command=self._take_snapshot).pack(side=tk.LEFT, padx=2)
+        # --- Middle: two-column layout ---
+        mid_frame = tk.Frame(self.root, bg=BG_DARK)
+        mid_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # Right: Alarm controls + log
-        right_frame = ttk.Frame(main_frame, width=320)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(5, 0))
-        right_frame.pack_propagate(False)
+        # Left column: controls + sensors
+        left_col = tk.Frame(mid_frame, bg=BG_DARK)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
 
-        # Alarm status
-        status_frame = ttk.LabelFrame(right_frame, text="Alarm Status")
-        status_frame.pack(fill=tk.X, pady=(0, 5))
+        # Arm/disarm buttons
+        ctrl_frame = tk.LabelFrame(
+            left_col, text=" Alarm Control ", fg=FG_ACCENT, bg=BG_PANEL,
+            font=("Helvetica", 10, "bold"),
+        )
+        ctrl_frame.pack(fill=tk.X, pady=(0, 5))
 
-        self.status_var = tk.StringVar(value="Connecting...")
-        ttk.Label(status_frame, textvariable=self.status_var,
-                  font=("Helvetica", 14, "bold")).pack(pady=10)
+        btn_cfg = {"font": ("Helvetica", 11, "bold"), "width": 18, "height": 2, "relief": "flat", "cursor": "hand2"}
 
-        self.hub_status_label = ttk.Label(status_frame, text="Hub: --")
-        self.hub_status_label.pack()
-        self.camera_status_label = ttk.Label(status_frame, text="Camera: --")
-        self.camera_status_label.pack(pady=(0, 5))
+        self.btn_away = tk.Button(
+            ctrl_frame, text="ARM AWAY", bg="#cc3333", fg="white",
+            command=lambda: self._set_mode(AlarmMode.AWAY), **btn_cfg,
+        )
+        self.btn_away.pack(pady=(8, 3), padx=10)
 
-        # Alarm controls
-        ctrl_frame = ttk.LabelFrame(right_frame, text="Alarm Control")
-        ctrl_frame.pack(fill=tk.X, pady=5)
+        self.btn_home = tk.Button(
+            ctrl_frame, text="ARM HOME", bg="#cc8800", fg="white",
+            command=lambda: self._set_mode(AlarmMode.HOME), **btn_cfg,
+        )
+        self.btn_home.pack(pady=3, padx=10)
 
-        btn_style = {"width": 20}
-        ttk.Button(ctrl_frame, text="🔒 ARM AWAY",
-                   command=lambda: self._set_mode("away"),
-                   **btn_style).pack(pady=2, padx=10)
-        ttk.Button(ctrl_frame, text="🏠 ARM HOME",
-                   command=lambda: self._set_mode("home"),
-                   **btn_style).pack(pady=2, padx=10)
-        ttk.Button(ctrl_frame, text="🔓 DISARM",
-                   command=lambda: self._set_mode("disarmed"),
-                   **btn_style).pack(pady=2, padx=10)
-        ttk.Button(ctrl_frame, text="🔔 TEST SIREN",
-                   command=self._test_siren,
-                   **btn_style).pack(pady=(10, 2), padx=10)
-        ttk.Button(ctrl_frame, text="🔕 SILENCE SIREN",
-                   command=self._silence_siren,
-                   **btn_style).pack(pady=(2, 10), padx=10)
+        self.btn_disarm = tk.Button(
+            ctrl_frame, text="DISARM", bg="#339933", fg="white",
+            command=lambda: self._set_mode(AlarmMode.DISARMED), **btn_cfg,
+        )
+        self.btn_disarm.pack(pady=3, padx=10)
 
-        # Event log
-        log_frame = ttk.LabelFrame(right_frame, text="Event Log")
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        # Separator
+        tk.Frame(ctrl_frame, bg=FG_DIM, height=1).pack(fill=tk.X, padx=10, pady=5)
+
+        self.btn_monitor = tk.Button(
+            ctrl_frame, text="MONITOR", bg=COL_MONITOR, fg="white",
+            command=lambda: self._toggle_monitor(muted=False), **btn_cfg,
+        )
+        self.btn_monitor.pack(pady=(3, 3), padx=10)
+
+        self.btn_day_monitor = tk.Button(
+            ctrl_frame, text="DAY MONITOR", bg="#336655", fg="white",
+            command=lambda: self._toggle_monitor(muted=True), **btn_cfg,
+        )
+        self.btn_day_monitor.pack(pady=(3, 3), padx=10)
+
+        self._night_light_on = False
+        self.btn_night_light = tk.Button(
+            ctrl_frame, text="NIGHT LIGHT", bg="#444466", fg="white",
+            command=self._toggle_night_light, **btn_cfg,
+        )
+        self.btn_night_light.pack(pady=(3, 8), padx=10)
+
+        # Sensor indicators
+        sensor_frame = tk.LabelFrame(
+            left_col, text=" Sensors ", fg=FG_ACCENT, bg=BG_PANEL,
+            font=("Helvetica", 10, "bold"),
+        )
+        sensor_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.sensor_indicators = {}
+        for name in self.SENSORS:
+            row = tk.Frame(sensor_frame, bg=BG_PANEL)
+            row.pack(fill=tk.X, padx=10, pady=2)
+
+            dot = tk.Label(row, text="●", fg=FG_DIM, bg=BG_PANEL, font=("Helvetica", 12))
+            dot.pack(side=tk.LEFT, padx=(0, 8))
+
+            label = tk.Label(row, text=name, fg=FG_TEXT, bg=BG_PANEL, font=("Helvetica", 10), anchor="w")
+            label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            status = tk.Label(row, text="Idle", fg=FG_DIM, bg=BG_PANEL, font=("Helvetica", 9))
+            status.pack(side=tk.RIGHT)
+
+            self.sensor_indicators[name] = {"dot": dot, "status": status, "row": row}
+
+        # Hub settings
+        settings_frame = tk.LabelFrame(
+            left_col, text=" Settings ", fg=FG_ACCENT, bg=BG_PANEL,
+            font=("Helvetica", 10, "bold"),
+        )
+        settings_frame.pack(fill=tk.X, pady=5)
+
+        self.settings_labels = {}
+        for key, label in [("volume", "Volume"), ("tone", "Alarm Tone"), ("duration", "Alarm Duration")]:
+            row = tk.Frame(settings_frame, bg=BG_PANEL)
+            row.pack(fill=tk.X, padx=10, pady=1)
+            tk.Label(row, text=f"{label}:", fg=FG_DIM, bg=BG_PANEL, font=("Helvetica", 9), width=14, anchor="w").pack(side=tk.LEFT)
+            val_label = tk.Label(row, text="--", fg=FG_TEXT, bg=BG_PANEL, font=("Helvetica", 9))
+            val_label.pack(side=tk.LEFT)
+            self.settings_labels[key] = val_label
+
+        # Right column: event log
+        right_col = tk.Frame(mid_frame, bg=BG_DARK, width=300)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        right_col.pack_propagate(False)
+
+        log_frame = tk.LabelFrame(
+            right_col, text=" Event Log ", fg=FG_ACCENT, bg=BG_PANEL,
+            font=("Helvetica", 10, "bold"),
+        )
+        log_frame.pack(fill=tk.BOTH, expand=True)
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame, height=10, width=35, font=("Consolas", 9)
+            log_frame, font=("Consolas", 9), bg="#0a0a1a", fg=FG_TEXT,
+            insertbackground=FG_TEXT, relief="flat", wrap=tk.WORD,
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-    def _log_event(self, message: str):
+        # Tag colours for log entries
+        self.log_text.tag_configure("sensor", foreground=COL_SENSOR)
+        self.log_text.tag_configure("alarm", foreground=COL_TRIGGERED)
+        self.log_text.tag_configure("mode", foreground=FG_ACCENT)
+        self.log_text.tag_configure("info", foreground=FG_DIM)
+
+        # --- Bottom: connection status bar ---
+        status_bar = tk.Frame(self.root, bg=BG_PANEL, height=25)
+        status_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        self.conn_label = tk.Label(
+            status_bar, text="Disconnected", fg=FG_DIM, bg=BG_PANEL,
+            font=("Helvetica", 9),
+        )
+        self.conn_label.pack(side=tk.LEFT, padx=10, pady=3)
+
+        self.ip_label = tk.Label(
+            status_bar, text="", fg=FG_DIM, bg=BG_PANEL,
+            font=("Helvetica", 9),
+        )
+        self.ip_label.pack(side=tk.RIGHT, padx=10, pady=3)
+
+    def _log_event(self, message: str, tag: str = "info"):
         """Add a timestamped event to the log panel."""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.insert(tk.END, f"[{timestamp}] ", "info")
+        self.log_text.insert(tk.END, f"{message}\n", tag)
         self.log_text.see(tk.END)
 
+    # --- Mode banner ---
+
+    def _update_mode_display(self, mode_value: str):
+        """Update the top banner to reflect the current alarm mode."""
+        # Don't overwrite banner if monitor mode is active
+        if self.hub.monitor_active:
+            return
+
+        try:
+            mode = AlarmMode(str(mode_value))
+            label = MODE_LABELS[mode]
+            colour = {
+                AlarmMode.AWAY: COL_ARMED,
+                AlarmMode.HOME: COL_HOME,
+                AlarmMode.DISARMED: COL_DISARMED,
+            }[mode]
+        except (ValueError, KeyError):
+            label = f"UNKNOWN ({mode_value})"
+            colour = FG_DIM
+
+        self.mode_frame.configure(bg=colour)
+        self.mode_label.configure(text=label, bg=colour)
+        self.triggered_label.configure(bg=colour)
+
+    def _update_triggered_display(self, triggered: bool):
+        """Show/hide the alarm triggered indicator."""
+        if triggered:
+            # In monitor mode, show a subdued triggered state (don't go full red)
+            if self.hub.monitor_active:
+                self.triggered_label.configure(text="Sensor triggered — handling...", fg="white")
+            else:
+                self.triggered_label.configure(text="ALARM TRIGGERED!", fg="white")
+                self.mode_frame.configure(bg=COL_TRIGGERED)
+                self.mode_label.configure(bg=COL_TRIGGERED)
+                self.triggered_label.configure(bg=COL_TRIGGERED)
+        else:
+            self.triggered_label.configure(text="")
+            # Restore monitor banner if still in monitor mode
+            if self.hub.monitor_active:
+                self._update_monitor_button(True, muted=self.hub.monitor_muted)
+
+    # --- Sensor indicators ---
+
+    def _flash_sensor(self, sensor_name: str):
+        """Briefly highlight a sensor that has triggered."""
+        for name, widgets in self.sensor_indicators.items():
+            if name.lower() in sensor_name.lower():
+                widgets["dot"].configure(fg=COL_SENSOR)
+                widgets["status"].configure(text="TRIGGERED", fg=COL_SENSOR)
+                # Reset after 10 seconds
+                self.root.after(10000, lambda w=widgets: self._reset_sensor(w))
+                break
+
+    def _reset_sensor(self, widgets: dict):
+        """Reset a sensor indicator to idle."""
+        widgets["dot"].configure(fg=FG_DIM)
+        widgets["status"].configure(text="Idle", fg=FG_DIM)
+
+    # --- Settings display ---
+
+    def _update_settings(self, status: dict):
+        """Update the settings panel from hub status."""
+        vol = status.get(DPS_VOLUME, "--")
+        try:
+            vol_label = VOLUME_LABELS[VolumeLevel(str(vol))]
+        except (ValueError, KeyError):
+            vol_label = str(vol)
+        self.settings_labels["volume"].configure(text=vol_label)
+
+        tone = status.get(DPS_ALARM_TONE, "--")
+        self.settings_labels["tone"].configure(text=str(tone))
+
+        dur = status.get(DPS_ALARM_DURATION, "--")
+        self.settings_labels["duration"].configure(text=str(dur))
+
+    # --- Connection and polling ---
+
     def start(self):
-        """Connect devices and start the dashboard."""
+        """Connect to hub and start the dashboard."""
         self.running = True
         self._log_event("Dashboard starting...")
 
-        # Connect hub in background thread
         if self.hub:
+            self.ip_label.configure(text=f"Hub: {self.hub.ip_address}")
             threading.Thread(target=self._connect_hub, daemon=True).start()
         else:
             self._log_event("No hub configured")
 
-        # Connect camera in background thread
-        if self.camera and CAMERA_AVAILABLE:
-            threading.Thread(target=self._connect_camera, daemon=True).start()
-        elif not CAMERA_AVAILABLE:
-            self._log_event("Camera deps missing (pip install opencv-python Pillow)")
-        else:
-            self._log_event("No camera configured")
-
-        # Start periodic updates
         self.root.after(self.POLL_INTERVAL_MS, self._poll_hub)
-        self.root.after(self.CAMERA_FRAME_MS, self._update_camera_frame)
+        self.root.after(self.ASYNC_CHECK_MS, self._check_async)
 
-        self._log_event("Dashboard ready")
         self.root.mainloop()
 
     def _connect_hub(self):
         """Connect to the alarm hub (background thread)."""
-        self.root.after(0, lambda: self._log_event("Connecting to hub..."))
+        original_ip = self.hub.ip_address
+        self.root.after(0, lambda: self._log_event(f"Connecting to hub at {original_ip}..."))
+
         if self.hub.connect():
             self._hub_connected = True
-            self.root.after(0, lambda: self._log_event("Hub connected!"))
-            self.root.after(0, lambda: self.hub_status_label.config(
-                text="Hub: Connected ✓"
+            # Check if IP changed via discovery
+            if self.hub.ip_address != original_ip:
+                self.root.after(0, lambda: self._log_event(
+                    f"Hub IP changed: {original_ip} → {self.hub.ip_address}", "mode"))
+                self.root.after(0, lambda: self.ip_label.configure(
+                    text=f"Hub: {self.hub.ip_address}"))
+            self.root.after(0, lambda: self._log_event("Hub connected!", "mode"))
+            self.root.after(0, lambda: self.conn_label.configure(
+                text="Connected", fg=COL_DISARMED,
             ))
 
-            # Add alarm change listener
-            def on_change(idx, new_val, old_val):
-                msg = f"DPS {idx}: {old_val} -> {new_val}"
-                self.root.after(0, lambda m=msg: self._log_event(m))
-                # Auto-snapshot
-                if self._camera_connected and self.camera:
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    path = os.path.join(SNAPSHOT_DIR, f"alarm_{ts}.jpg")
-                    self.camera.snapshot(save_path=path)
-                    self.root.after(
-                        0, lambda p=path: self._log_event(f"Snapshot: {p}")
-                    )
+            # Read initial status
+            status = self.hub.status()
+            if "error" not in status:
+                self._last_status = dict(status)
+                mode = status.get(DPS_ALARM_MODE, "?")
+                self.root.after(0, lambda m=mode: self._update_mode_display(m))
+                self.root.after(0, lambda s=status: self._update_settings(s))
 
-            self.hub.add_listener(on_change)
+                for line in self.hub.status_pretty():
+                    self.root.after(0, lambda l=line: self._log_event(l, "info"))
         else:
-            self.root.after(0, lambda: self._log_event("Hub connection failed"))
-            self.root.after(0, lambda: self.hub_status_label.config(
-                text="Hub: Disconnected ✗"
-            ))
-
-    def _connect_camera(self):
-        """Connect to the camera (background thread)."""
-        self.root.after(0, lambda: self._log_event("Connecting to camera..."))
-        if self.camera.connect():
-            self._camera_connected = True
-            self.root.after(0, lambda: self._log_event("Camera connected!"))
-            self.root.after(0, lambda: self.camera_status_label.config(
-                text="Camera: Connected ✓"
-            ))
-        else:
-            self.root.after(0, lambda: self._log_event("Camera connection failed"))
-            self.root.after(0, lambda: self.camera_status_label.config(
-                text="Camera: Disconnected ✗"
+            self.root.after(0, lambda: self._log_event("Hub connection failed!", "alarm"))
+            self.root.after(0, lambda: self.conn_label.configure(
+                text="Connection failed", fg=COL_ARMED,
             ))
 
     def _poll_hub(self):
-        """Periodically poll the alarm hub for status changes."""
+        """Periodically poll the hub for status changes."""
         if not self.running:
             return
 
@@ -362,101 +462,189 @@ class SecurityDashboard:
             try:
                 status = self.hub.status()
                 if "error" not in status:
-                    # Detect changes
-                    for idx, val in status.items():
-                        old = self._last_hub_status.get(idx)
-                        if old is not None and old != val:
-                            self._log_event(f"DPS {idx}: {old} -> {val}")
-                    self._last_hub_status = dict(status)
-
-                    # Update mode display
-                    mode = status.get("2", status.get(2, "unknown"))
-                    self.status_var.set(f"Mode: {str(mode).upper()}")
+                    self._process_status_changes(status)
+                    self._last_status = dict(status)
             except Exception as e:
-                self._log_event(f"Hub poll error: {e}")
+                self._log_event(f"Poll error: {e}", "alarm")
 
         self.root.after(self.POLL_INTERVAL_MS, self._poll_hub)
 
-    def _update_camera_frame(self):
-        """Update the camera feed display."""
+    def _check_async(self):
+        """Check for async push messages from the hub."""
         if not self.running:
             return
 
-        if self._camera_connected and self.camera and CAMERA_AVAILABLE:
-            frame = self.camera.read_frame()
-            if frame is not None:
-                # Resize for display
-                frame = cv2.resize(
-                    frame,
-                    (self.CAMERA_DISPLAY_WIDTH, self.CAMERA_DISPLAY_HEIGHT)
-                )
-                # Add timestamp overlay
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cv2.putText(
-                    frame, ts, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1
-                )
-                # Convert BGR -> RGB -> PIL -> Tk
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(rgb)
-                imgtk = ImageTk.PhotoImage(image=img)
-                self.camera_label.imgtk = imgtk  # Keep reference
-                self.camera_label.configure(image=imgtk)
+        if self._hub_connected and self.hub and self.hub._device:
+            events = self.hub.monitor_check_async()
+            for event in events:
+                dps = event.get("dps", {})
+                if dps:
+                    self._process_async_dps(dps)
 
-        self.root.after(self.CAMERA_FRAME_MS, self._update_camera_frame)
+        self.root.after(self.ASYNC_CHECK_MS, self._check_async)
+
+    def _process_status_changes(self, status: dict):
+        """Detect and display changes from polled status."""
+        mode = status.get(DPS_ALARM_MODE)
+        if mode:
+            old_mode = self._last_status.get(DPS_ALARM_MODE)
+            if old_mode != mode:
+                self._update_mode_display(mode)
+                desc = describe_dps(DPS_ALARM_MODE, mode)
+                self._log_event(desc, "mode")
+
+        triggered = status.get(DPS_ALARM_TRIGGERED)
+        if triggered is not None:
+            old_triggered = self._last_status.get(DPS_ALARM_TRIGGERED)
+            if old_triggered != triggered:
+                self._update_triggered_display(triggered)
+                if triggered:
+                    self._log_event("ALARM TRIGGERED!", "alarm")
+                else:
+                    self._log_event("Alarm cleared", "mode")
+
+        siren = status.get(DPS_SIREN)
+        if siren is not None:
+            old_siren = self._last_status.get(DPS_SIREN)
+            if old_siren != siren:
+                self._update_night_light_button(siren)
+                if siren:
+                    self._log_event("Night light ON", "info")
+                else:
+                    self._log_event("Night light OFF", "info")
+
+        self._update_settings(status)
+
+    def _process_async_dps(self, dps: dict):
+        """Process async push DPS data from the hub."""
+        # Sensor event
+        if DPS_SENSOR_EVENT in dps:
+            sensor_name = decode_utf16_base64(dps[DPS_SENSOR_EVENT])
+            self._log_event(f"SENSOR: {sensor_name}", "sensor")
+            self._flash_sensor(sensor_name)
+
+        # Notification
+        if DPS_NOTIFICATION in dps:
+            notification = decode_utf16_base64(dps[DPS_NOTIFICATION])
+            self._log_event(f"Notification: {notification}", "mode")
+
+        # Triggered state
+        if DPS_ALARM_TRIGGERED in dps:
+            self._update_triggered_display(dps[DPS_ALARM_TRIGGERED])
+            if dps[DPS_ALARM_TRIGGERED]:
+                self._log_event("ALARM TRIGGERED!", "alarm")
+
+        # Mode change
+        if DPS_ALARM_MODE in dps:
+            self._update_mode_display(dps[DPS_ALARM_MODE])
 
     # --- Button handlers ---
 
-    def _set_mode(self, mode: str):
+    def _set_mode(self, mode: AlarmMode):
         """Set alarm mode from button click."""
         if not self._hub_connected:
-            self._log_event("Hub not connected!")
+            self._log_event("Hub not connected!", "alarm")
             return
 
-        mode_map = {
-            "away": AlarmMode.AWAY,
-            "home": AlarmMode.HOME,
-            "disarmed": AlarmMode.DISARMED,
+        # Exit monitor mode if active
+        if self.hub.monitor_active:
+            self.hub._monitor_active = False
+            self._update_monitor_button(False)
+
+        label = MODE_LABELS[mode]
+        self._log_event(f"Setting mode: {label}...", "mode")
+        threading.Thread(
+            target=lambda: self.hub.set_mode(mode),
+            daemon=True,
+        ).start()
+
+    def _toggle_monitor(self, muted: bool = False):
+        """Toggle monitor mode on/off."""
+        if not self._hub_connected:
+            self._log_event("Hub not connected!", "alarm")
+            return
+
+        if self.hub.monitor_active:
+            self._log_event("Stopping monitor mode...", "mode")
+            self._update_monitor_button(False)
+            threading.Thread(target=self.hub.stop_monitor, daemon=True).start()
+        else:
+            label = "day monitor (muted)" if muted else "monitor"
+            self._log_event(f"Starting {label} mode...", "mode")
+            self._update_monitor_button(True, muted=muted)
+
+            def on_monitor_event(event_type, message):
+                self.root.after(0, lambda: self._handle_monitor_event(event_type, message))
+
+            self.hub.add_monitor_listener(on_monitor_event)
+            threading.Thread(
+                target=lambda: self.hub.start_monitor(muted=muted),
+                daemon=True,
+            ).start()
+
+    def _handle_monitor_event(self, event_type: str, message: str):
+        """Handle events from monitor mode."""
+        tag_map = {
+            "sensor": "sensor",
+            "silence": "mode",
+            "rearm": "mode",
+            "info": "info",
         }
-        self._log_event(f"Setting mode: {mode}")
-        threading.Thread(
-            target=lambda: self.hub.set_mode(mode_map[mode]),
-            daemon=True,
-        ).start()
+        tag = tag_map.get(event_type, "info")
+        prefix = {
+            "sensor": "SENSOR",
+            "silence": "MONITOR",
+            "rearm": "MONITOR",
+            "info": "MONITOR",
+        }.get(event_type, "MONITOR")
+        self._log_event(f"{prefix}: {message}", tag)
 
-    def _test_siren(self):
+    def _toggle_night_light(self):
+        """Toggle the night light on/off."""
         if not self._hub_connected:
+            self._log_event("Hub not connected!", "alarm")
             return
-        self._log_event("Testing siren...")
+
+        self._night_light_on = not self._night_light_on
+        state = self._night_light_on
+        self._log_event(f"Night light {'ON' if state else 'OFF'}...", "info")
+        self._update_night_light_button(state)
         threading.Thread(
-            target=lambda: self.hub.trigger_siren(True),
+            target=lambda: self.hub.set_night_light(state),
             daemon=True,
         ).start()
 
-    def _silence_siren(self):
-        if not self._hub_connected:
-            return
-        self._log_event("Silencing siren...")
-        threading.Thread(
-            target=lambda: self.hub.trigger_siren(False),
-            daemon=True,
-        ).start()
+    def _update_night_light_button(self, on: bool):
+        """Update the night light button appearance."""
+        if on:
+            self.btn_night_light.configure(text="NIGHT LIGHT (ON)", bg="#ccaa00")
+            self._night_light_on = True
+        else:
+            self.btn_night_light.configure(text="NIGHT LIGHT", bg="#444466")
+            self._night_light_on = False
 
-    def _take_snapshot(self):
-        if not self._camera_connected:
-            self._log_event("Camera not connected!")
-            return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(SNAPSHOT_DIR, f"manual_{ts}.jpg")
-        result = self.camera.snapshot(save_path=path)
-        if result:
-            self._log_event(f"Snapshot saved: {path}")
+    def _update_monitor_button(self, active: bool, muted: bool = False):
+        """Update the monitor button appearances."""
+        if active:
+            if muted:
+                self.btn_day_monitor.configure(text="DAY MONITOR (ON)", bg="#44aa77")
+                self.btn_monitor.configure(text="MONITOR", bg=COL_MONITOR)
+                self.mode_frame.configure(bg="#336655")
+                self.mode_label.configure(text="DAY MONITOR", bg="#336655")
+                self.triggered_label.configure(text="Silent tracking (muted)", bg="#336655")
+            else:
+                self.btn_monitor.configure(text="MONITOR (ON)", bg="#8866ee")
+                self.btn_day_monitor.configure(text="DAY MONITOR", bg="#336655")
+                self.mode_frame.configure(bg=COL_MONITOR)
+                self.mode_label.configure(text="MONITOR", bg=COL_MONITOR)
+                self.triggered_label.configure(text="Silent sensor tracking", bg=COL_MONITOR)
+        else:
+            self.btn_monitor.configure(text="MONITOR", bg=COL_MONITOR)
+            self.btn_day_monitor.configure(text="DAY MONITOR", bg="#336655")
 
     def _on_close(self):
         """Clean shutdown."""
         self.running = False
-        if self.camera:
-            self.camera.disconnect()
         if self.hub:
             self.hub.disconnect()
         self.root.destroy()
@@ -467,30 +655,27 @@ class SecurityDashboard:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Unified security dashboard"
-    )
+    parser = argparse.ArgumentParser(description="AGSHome alarm hub dashboard")
     parser.add_argument(
         "--headless", action="store_true",
-        help="Run without GUI (logging/snapshots only)"
+        help="Run without GUI (logging only)",
     )
     args = parser.parse_args()
 
     config = load_config()
     hub = create_hub(config)
-    camera = create_camera(config)
 
-    if not hub and not camera:
-        print("No devices configured!")
-        print("Run discover.py (for hub) and discover_camera.py (for camera) first.")
+    if not hub:
+        print("No hub configured!")
+        print("Run discover.py first, or check config.json / devices.json.")
         sys.exit(1)
 
     if args.headless or not TK_AVAILABLE:
         if not TK_AVAILABLE and not args.headless:
             print("tkinter not available. Running in headless mode.")
-        run_headless(hub, camera)
+        run_headless(hub)
     else:
-        dashboard = SecurityDashboard(hub, camera)
+        dashboard = SecurityDashboard(hub)
         dashboard.start()
 
 

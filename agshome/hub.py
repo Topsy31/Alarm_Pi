@@ -6,12 +6,18 @@ local network (Tuya encrypted protocol). No cloud dependency at runtime.
 """
 
 import logging
+import threading
 import time
 from typing import Any, Callable, Optional
 
 import tinytuya
 
-from .dps_map import AlarmMode, DPS_ALARM_MODE, DPS_SIREN, describe_dps
+from .dps_map import (
+    AlarmMode, VolumeLevel, DPS_ALARM_MODE, DPS_ALARM_TRIGGERED, DPS_SIREN,
+    DPS_VOLUME, DPS_ZONE_1_ENABLED, DPS_ZONE_2_ENABLED,
+    DPS_SENSOR_EVENT, DPS_NOTIFICATION,
+    describe_dps, decode_utf16_base64,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +53,32 @@ class AGSHomeHub:
         """
         Connect to the hub on the local network.
 
+        Tries the configured IP first. If that fails, runs UDP discovery
+        to find the hub by device ID (handles DHCP address changes).
+
         Returns True on success.
         """
+        if self._try_connect(self.ip_address):
+            return True
+
+        # Configured IP failed — try discovery
+        logger.info("Configured IP failed, scanning network for hub...")
+        discovered_ip = self._discover_device()
+        if discovered_ip and discovered_ip != self.ip_address:
+            logger.info(f"Hub discovered at new IP: {discovered_ip}")
+            if self._try_connect(discovered_ip):
+                self.ip_address = discovered_ip
+                return True
+
+        logger.error("Hub connection failed (configured IP and discovery both failed)")
+        return False
+
+    def _try_connect(self, ip: str) -> bool:
+        """Attempt connection to the hub at a specific IP."""
         try:
             device = tinytuya.Device(
                 dev_id=self.device_id,
-                address=self.ip_address,
+                address=ip,
                 local_key=self.local_key,
                 version=self.version,
             )
@@ -60,18 +86,35 @@ class AGSHomeHub:
             result = device.status()
 
             if "Error" in result or "Err" in result:
-                logger.error(f"Hub connection error: {result}")
+                logger.warning(f"Connection to {ip} failed: {result}")
                 return False
 
             self._device = device
             self._last_status = result.get("dps", {})
-            logger.info(f"Hub connected at {self.ip_address} (v{self.version})")
+            logger.info(f"Hub connected at {ip} (v{self.version})")
             logger.info(f"Initial DPS: {self._last_status}")
             return True
 
         except Exception as e:
-            logger.error(f"Hub connection failed: {e}")
+            logger.warning(f"Connection to {ip} failed: {e}")
             return False
+
+    def _discover_device(self) -> Optional[str]:
+        """Scan the local network for the hub by device ID via UDP broadcast."""
+        try:
+            logger.info("Running TinyTuya UDP discovery...")
+            devices = tinytuya.deviceScan(verbose=False, maxretry=15)
+
+            for ip, info in devices.items():
+                if info.get("gwId") == self.device_id:
+                    logger.info(f"Found hub: {ip} (version {info.get('version', '?')})")
+                    return ip
+
+            logger.warning(f"Device {self.device_id} not found on network")
+            return None
+        except Exception as e:
+            logger.error(f"Discovery failed: {e}")
+            return None
 
     def disconnect(self):
         """Close the connection to the hub."""
@@ -120,8 +163,16 @@ class AGSHomeHub:
         return self._set_dps(DPS_ALARM_MODE, mode.value)
 
     def trigger_siren(self, on: bool = True) -> bool:
-        """Turn the siren on or off."""
+        """Turn the siren on or off (DPS 104)."""
         return self._set_dps(DPS_SIREN, on)
+
+    def set_night_light(self, on: bool = True) -> bool:
+        """Turn the night light on or off (DPS 104 — shared with siren)."""
+        return self._set_dps(DPS_SIREN, on)
+
+    def set_volume(self, level: VolumeLevel) -> bool:
+        """Set the hub volume level."""
+        return self._set_dps(DPS_VOLUME, level.value)
 
     def set_dps_value(self, index: str, value: Any) -> bool:
         """Set an arbitrary DPS value (for testing/discovery)."""
@@ -189,6 +240,203 @@ class AGSHomeHub:
         while True:
             self.poll_once()
             time.sleep(interval)
+
+    # --- Monitor Mode ---
+
+    def __init_monitor_state(self):
+        """Initialise monitor mode state (called lazily)."""
+        if not hasattr(self, "_monitor_active"):
+            self._monitor_active = False
+            self._monitor_muted = False
+            self._monitor_saved_volume: Optional[str] = None
+            self._monitor_rearming = False
+            self._monitor_listeners: list[Callable] = []
+
+    @property
+    def monitor_active(self) -> bool:
+        """Whether monitor mode is currently running."""
+        self.__init_monitor_state()
+        return self._monitor_active
+
+    @property
+    def monitor_muted(self) -> bool:
+        """Whether monitor mode is running with muted volume."""
+        self.__init_monitor_state()
+        return self._monitor_muted
+
+    def add_monitor_listener(self, callback: Callable[[str, str], None]):
+        """
+        Register a callback for monitor mode sensor events.
+
+        Callback signature: callback(event_type, message)
+        event_type is one of: "sensor", "rearm", "silence", "info"
+        """
+        self.__init_monitor_state()
+        self._monitor_listeners.append(callback)
+
+    def _notify_monitor(self, event_type: str, message: str):
+        """Notify all monitor listeners."""
+        self.__init_monitor_state()
+        for listener in self._monitor_listeners:
+            try:
+                listener(event_type, message)
+            except Exception as e:
+                logger.error(f"Monitor listener error: {e}")
+
+    def start_monitor(self, muted: bool = False):
+        """
+        Enter monitor mode.
+
+        Sets the hub to HOME mode so sensors are active, then silently
+        monitors all events. When a sensor triggers:
+          1. Immediately silences the siren
+          2. Logs the sensor event
+          3. Re-arms to HOME mode
+
+        Args:
+            muted: If True, set volume to mute before arming (day monitor).
+                   Volume is restored when monitor mode exits.
+
+        Call stop_monitor() to exit.
+        """
+        self.__init_monitor_state()
+        if self._monitor_active:
+            logger.warning("Monitor mode already active")
+            return
+
+        self._monitor_active = True
+        self._monitor_muted = muted
+
+        # If muted, save current volume and set to mute
+        if muted:
+            status = self.status()
+            if "error" not in status:
+                self._monitor_saved_volume = status.get(DPS_VOLUME)
+            self.set_volume(VolumeLevel.MUTE)
+            logger.info("Monitor: volume muted")
+            self._notify_monitor("info", "Volume muted")
+
+        # Arm to HOME so sensors are active
+        self.set_mode(AlarmMode.HOME)
+        mode_label = "Monitor mode (muted)" if muted else "Monitor mode"
+        logger.info(f"{mode_label} started (hub set to HOME)")
+        self._notify_monitor("info", f"{mode_label} started")
+
+    def stop_monitor(self):
+        """Exit monitor mode and disarm the hub."""
+        self.__init_monitor_state()
+        if not self._monitor_active:
+            return
+
+        self._monitor_active = False
+
+        # Restore volume if it was muted
+        if self._monitor_muted and self._monitor_saved_volume is not None:
+            self._set_dps(DPS_VOLUME, self._monitor_saved_volume)
+            logger.info(f"Monitor: volume restored to {self._monitor_saved_volume}")
+            self._notify_monitor("info", "Volume restored")
+            self._monitor_saved_volume = None
+        self._monitor_muted = False
+
+        self.set_mode(AlarmMode.DISARMED)
+        logger.info("Monitor mode stopped (hub disarmed)")
+        self._notify_monitor("info", "Monitor mode stopped")
+
+    def monitor_check_async(self) -> list[dict]:
+        """
+        Check for async events from the hub and handle monitor logic.
+
+        Returns a list of event dicts: [{"type": str, "message": str, "dps": dict}]
+        Call this frequently (every 200-500ms) for responsive monitoring.
+        """
+        self.__init_monitor_state()
+        events = []
+
+        if not self._device:
+            return events
+
+        try:
+            self._device.set_socketTimeout(0.1)
+            data = self._device.receive()
+            if not data or not isinstance(data, dict):
+                return events
+
+            dps = data.get("dps", {})
+            if not dps and "data" in data:
+                dps = data["data"].get("dps", {})
+            if not dps:
+                return events
+
+            logger.debug(f"Async DPS received: {dps}")
+
+            # Sensor event (DPS 116 — may or may not arrive via async)
+            if DPS_SENSOR_EVENT in dps:
+                sensor_name = decode_utf16_base64(dps[DPS_SENSOR_EVENT])
+                events.append({"type": "sensor", "message": sensor_name, "dps": dps})
+                logger.info(f"Monitor: sensor event — {sensor_name}")
+                self._notify_monitor("sensor", sensor_name)
+
+            # Notification (DPS 121 — often contains sensor name)
+            if DPS_NOTIFICATION in dps:
+                notification = decode_utf16_base64(dps[DPS_NOTIFICATION])
+                events.append({"type": "notification", "message": notification, "dps": dps})
+
+            # Alarm triggered (DPS 103) — primary trigger for monitor re-arm
+            if DPS_ALARM_TRIGGERED in dps:
+                triggered = dps[DPS_ALARM_TRIGGERED]
+                events.append({"type": "triggered", "message": str(triggered), "dps": dps})
+
+                # In monitor mode: silence siren and re-arm in background thread
+                if triggered and self._monitor_active and not self._monitor_rearming:
+                    threading.Thread(
+                        target=self._monitor_rearm_sequence,
+                        daemon=True,
+                    ).start()
+
+            # Mode change
+            if DPS_ALARM_MODE in dps:
+                mode_val = dps[DPS_ALARM_MODE]
+                events.append({"type": "mode", "message": mode_val, "dps": dps})
+
+        except Exception:
+            pass
+
+        return events
+
+    def _monitor_rearm_sequence(self):
+        """Background thread: silence siren, clear trigger, re-enable zones.
+
+        Uses direct DPS writes to avoid mode changes, which eliminates
+        the arm/disarm beeps from the hub.
+        """
+        self._monitor_rearming = True
+        try:
+            # 1. Silence siren / night light
+            logger.info("Monitor: silencing siren...")
+            self.trigger_siren(False)
+            self._notify_monitor("silence", "Siren silenced")
+
+            time.sleep(0.3)
+
+            # 2. Clear the trigger flag directly (no mode change = no beep)
+            logger.info("Monitor: clearing trigger...")
+            self._set_dps(DPS_ALARM_TRIGGERED, False)
+
+            time.sleep(0.3)
+
+            # 3. Re-enable zones (trigger disables them)
+            if self._monitor_active:
+                logger.info("Monitor: re-enabling zones...")
+                self._set_dps(DPS_ZONE_1_ENABLED, True)
+                time.sleep(0.2)
+                self._set_dps(DPS_ZONE_2_ENABLED, True)
+
+                self._notify_monitor("rearm", "Re-armed (silent)")
+                logger.info("Monitor: re-arm sequence complete (silent)")
+        except Exception as e:
+            logger.error(f"Monitor re-arm error: {e}")
+        finally:
+            self._monitor_rearming = False
 
     # --- Utilities ---
 

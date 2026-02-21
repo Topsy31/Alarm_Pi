@@ -19,10 +19,10 @@ class AlarmMode(str, Enum):
 
 DPS_ALARM_MODE = "101"        # Alarm mode: "1"=away, "2"=disarmed, "3"=home
 DPS_ALARM_TRIGGERED = "103"   # Alarm triggered (bool)
-DPS_SIREN = "104"             # Siren on/off (bool)
-DPS_ALARM_DURATION = "105"    # Alarm/siren duration (int, likely minutes)
-DPS_VOLUME = "106"            # Volume level (str, e.g. "7")
-DPS_ENTRY_DELAY = "107"       # Entry/exit delay in seconds (str, e.g. "25")
+DPS_SIREN = "104"             # Siren / night light (bool) — dual purpose
+DPS_ALARM_DURATION = "105"    # Alarm/siren duration (int, minutes)
+DPS_ALARM_TONE = "106"        # Alarm tone/ringtone (str, "1"-"8")
+DPS_VOLUME = "107"            # Volume level (str): "0"=mute, "25"=low, "50"=medium, "100"=high
 DPS_ZONE_1_ENABLED = "111"    # Zone 1 enabled (bool)
 DPS_ZONE_2_ENABLED = "112"    # Zone 2 enabled (bool)
 DPS_ZONE_1_SENSITIVITY = "113"  # Zone 1 sensitivity (int)
@@ -34,10 +34,10 @@ DPS_NOTIFICATION = "121"        # Status notification (base64-encoded UTF-16 str
 DPS_NAMES = {
     DPS_ALARM_MODE: "Alarm Mode",
     DPS_ALARM_TRIGGERED: "Alarm Triggered",
-    DPS_SIREN: "Siren",
+    DPS_SIREN: "Siren / Night Light",
     DPS_ALARM_DURATION: "Alarm Duration",
+    DPS_ALARM_TONE: "Alarm Tone",
     DPS_VOLUME: "Volume",
-    DPS_ENTRY_DELAY: "Entry/Exit Delay",
     DPS_ZONE_1_ENABLED: "Zone 1 Enabled",
     DPS_ZONE_2_ENABLED: "Zone 2 Enabled",
     DPS_ZONE_1_SENSITIVITY: "Zone 1 Sensitivity",
@@ -46,11 +46,26 @@ DPS_NAMES = {
     DPS_NOTIFICATION: "Notification",
 }
 
+class VolumeLevel(str, Enum):
+    """Volume levels (DPS 107 values, confirmed from live device)."""
+    MUTE = "0"
+    LOW = "25"
+    MEDIUM = "50"
+    HIGH = "100"
+
+
 # Mode display labels
 MODE_LABELS = {
     AlarmMode.DISARMED: "DISARMED",
     AlarmMode.HOME: "HOME",
     AlarmMode.AWAY: "AWAY",
+}
+
+VOLUME_LABELS = {
+    VolumeLevel.MUTE: "Mute",
+    VolumeLevel.LOW: "Low",
+    VolumeLevel.MEDIUM: "Medium",
+    VolumeLevel.HIGH: "High",
 }
 
 
@@ -72,6 +87,13 @@ def describe_dps(index: str, value) -> str:
         try:
             mode = AlarmMode(str(value))
             return f"{name}: {MODE_LABELS[mode]}"
+        except ValueError:
+            pass
+
+    if str(index) == DPS_VOLUME:
+        try:
+            vol = VolumeLevel(str(value))
+            return f"{name}: {VOLUME_LABELS[vol]}"
         except ValueError:
             pass
 
