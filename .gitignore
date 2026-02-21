@@ -14,6 +14,7 @@ devices.json
 
 # TinyTuya wizard output
 tinytuya.json
+tuya-raw.json
 snapshot.json
 
 # Snapshots (generated at runtime)
