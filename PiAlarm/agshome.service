@@ -1,0 +1,17 @@
+[Unit]
+Description=AGSHome Alarm Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/agshome
+ExecStart=/home/pi/agshome/venv/bin/python pi_service.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

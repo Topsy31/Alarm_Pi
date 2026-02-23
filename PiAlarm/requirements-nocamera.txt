@@ -1,0 +1,5 @@
+tinytuya>=1.13.0
+colorama>=0.4.6
+flask>=3.0.0
+zeroconf==0.38.7
+requests>=2.31.0
