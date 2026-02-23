@@ -30,7 +30,9 @@ echo ""
 # ---- 1. System packages ----
 echo "[1/5] Installing system packages..."
 sudo apt-get update -qq
+# Install pre-compiled system Python packages to avoid compilation on slow Pi hardware
 sudo apt-get install -y python3 python3-pip python3-venv \
+    python3-cryptography python3-flask \
     avahi-daemon avahi-utils
 
 # Ensure Avahi (mDNS) is running
@@ -40,13 +42,15 @@ echo "      Avahi mDNS daemon enabled."
 
 # ---- 2. Virtual environment ----
 echo "[2/5] Creating Python virtual environment..."
-python3 -m venv "$VENV_DIR"
+# --system-site-packages lets the venv use pre-compiled system packages
+# (avoids building cryptography/flask from source, which fails on Pi 1 B+)
+python3 -m venv --system-site-packages "$VENV_DIR"
 echo "      venv created at $VENV_DIR"
 
 # ---- 3. Python dependencies ----
 echo "[3/5] Installing Python dependencies..."
 "$VENV_DIR/bin/pip" install --upgrade pip -q
-"$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements-nocamera.txt"
+"$VENV_DIR/bin/pip" install tinytuya requests colorama "zeroconf==0.38.7"
 echo "      Dependencies installed."
 
 # ---- 4. systemd service ----
