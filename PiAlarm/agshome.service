@@ -7,9 +7,10 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/agshome
+ExecStartPre=/bin/sleep 15
 ExecStart=/home/pi/agshome/venv/bin/python pi_service.py
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 StandardOutput=journal
 StandardError=journal
 

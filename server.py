@@ -72,6 +72,7 @@ class AppState:
         self.camera_connected = False
         self._monitor_running = False
         self._monitor_thread: Optional[threading.Thread] = None
+        self.suspended_until: Optional[float] = None  # epoch time when suspension ends
 
 
 state = AppState()
@@ -336,6 +337,10 @@ def desktop():
 @app.route("/api/status")
 def api_status():
     with state.lock:
+        suspended_secs = 0
+        if state.suspended_until is not None:
+            remaining = state.suspended_until - time.time()
+            suspended_secs = max(0, int(remaining))
         return jsonify({
             "mode": state.mode,
             "night_light": state.night_light,
@@ -344,6 +349,7 @@ def api_status():
             "last_sensor_name": state.last_sensor_name,
             "last_sensor_time": state.last_sensor_time,
             "alert_seq": state.alert_seq,
+            "suspended_secs": suspended_secs,
         })
 
 
@@ -411,6 +417,59 @@ def api_silent_night():
         state.mode = "silent_night"
     send_ntfy("Silent night active", tags="zzz")
     return jsonify({"ok": True, "mode": "silent_night"})
+
+
+SUSPEND_DURATION = 10 * 60  # 10 minutes in seconds
+SUSPEND_SENSOR = "Hallway Door Alarm"
+
+
+@app.route("/api/suspend", methods=["POST"])
+def api_suspend():
+    """
+    Dog Door: silently disable zones for 10 minutes then re-enable.
+
+    Only active when in night or silent_night monitor mode.
+    No hub beeps at any point.
+    """
+    if not state.hub_connected:
+        return jsonify({"error": "Hub not connected"}), 503
+    with state.lock:
+        current_mode = state.mode
+    if current_mode not in ("night", "silent_night"):
+        return jsonify({"error": "Only available in night or silent night mode"}), 400
+
+    def _suspend_then_resume():
+        state.hub.suspend_zones()
+        resume_at = time.time() + SUSPEND_DURATION
+        with state.lock:
+            state.suspended_until = resume_at
+        logger.info(f"Dog door: zones suspended for {SUSPEND_DURATION // 60} minutes")
+        send_ntfy(f"Dog door: alarm suspended for {SUSPEND_DURATION // 60} min", tags="dog")
+        time.sleep(SUSPEND_DURATION)
+        with state.lock:
+            still_suspended = state.suspended_until == resume_at
+        if still_suspended and state.hub and state.hub.monitor_active:
+            state.hub.resume_zones()
+            with state.lock:
+                state.suspended_until = None
+            logger.info("Dog door: zones resumed automatically")
+            send_ntfy("Dog door: alarm resumed", tags="lock")
+
+    threading.Thread(target=_suspend_then_resume, daemon=True).start()
+    return jsonify({"ok": True, "suspended_secs": SUSPEND_DURATION})
+
+
+@app.route("/api/suspend/cancel", methods=["POST"])
+def api_suspend_cancel():
+    """Cancel an active suspension and immediately re-enable zones."""
+    if not state.hub_connected:
+        return jsonify({"error": "Hub not connected"}), 503
+    with state.lock:
+        state.suspended_until = None
+    if state.hub and state.hub.monitor_active:
+        state.hub.resume_zones()
+    logger.info("Dog door: suspension cancelled, zones resumed")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/nightlight", methods=["POST"])

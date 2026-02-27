@@ -452,6 +452,34 @@ class AGSHomeHub:
         finally:
             self._monitor_rearming = False
 
+    def suspend_zones(self) -> bool:
+        """
+        Silently disable all sensor zones — no beep, no siren.
+
+        Used for the Dog Door feature: temporarily suspends monitoring
+        so a door can be opened without triggering the alarm. Call
+        resume_zones() to re-enable.
+
+        Safe to call during monitor mode — does not stop monitoring.
+        """
+        logger.info("Monitor: suspending zones (silent)...")
+        ok1 = self._set_dps(DPS_ZONE_1_ENABLED, False)
+        ok2 = self._set_dps(DPS_ZONE_2_ENABLED, False)
+        self._notify_monitor("info", "Zones suspended (dog door)")
+        return ok1 and ok2
+
+    def resume_zones(self) -> bool:
+        """
+        Silently re-enable all sensor zones — no beep.
+
+        Call after suspend_zones() when the door has been closed.
+        """
+        logger.info("Monitor: resuming zones (silent)...")
+        ok1 = self._set_dps(DPS_ZONE_1_ENABLED, True)
+        ok2 = self._set_dps(DPS_ZONE_2_ENABLED, True)
+        self._notify_monitor("info", "Zones resumed")
+        return ok1 and ok2
+
     # --- Utilities ---
 
     def __repr__(self) -> str:

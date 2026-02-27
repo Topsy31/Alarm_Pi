@@ -105,6 +105,9 @@
         .btn-silent  { background: var(--teal); grid-column: span 2; }
         .btn-nl      { background: var(--grey); grid-column: span 2; }
         .btn-nl.on   { background: var(--yellow); }
+        .btn-dog     { background: #2e6b3e; grid-column: span 2; display: none; }
+        .btn-dog.active { background: #1a4a2a; border-color: var(--accent); }
+        .btn-dog.visible { display: block; }
 
         .sensor {
             background: var(--card);
@@ -134,6 +137,7 @@
         <button class="btn btn-night"  id="bNight"  onclick="cmd('night')">NIGHT</button>
         <button class="btn btn-silent" id="bSilent" onclick="cmd('silent_night')">SILENT NIGHT</button>
         <button class="btn btn-nl"     id="bNL"     onclick="cmd('nightlight')">NIGHT LIGHT</button>
+        <button class="btn btn-dog"    id="bDog"    onclick="dogDoor()">🐕 DOG DOOR (10 min)</button>
     </div>
 
     <div class="sensor">
@@ -147,6 +151,7 @@
         const COLOURS = { disarmed: "#44cc44", away: "#ff4444", day: "#dd8800", night: "#6644cc", silent_night: "#008888" };
         let busy = false;
         let lastAlertSeq = -1;  // tracks server alert_seq to detect new triggers
+        let dogCountdownInterval = null;
 
         async function cmd(action) {
             if (busy) return;
@@ -166,6 +171,61 @@
 
         function setBusy(on) {
             document.querySelectorAll(".btn").forEach(b => b.disabled = on);
+        }
+
+        async function dogDoor() {
+            if (busy) return;
+            const btn = document.getElementById("bDog");
+            if (btn.classList.contains("active")) {
+                // Cancel suspension
+                await fetch("/api/suspend/cancel", { method: "POST" });
+                clearDogCountdown();
+            } else {
+                // Start suspension
+                busy = true;
+                setBusy(true);
+                try {
+                    const r = await fetch("/api/suspend", { method: "POST" });
+                    if (r.ok) {
+                        startDogCountdown(10 * 60);
+                    }
+                    await poll();
+                } catch (e) {
+                    console.error(e);
+                } finally {
+                    busy = false;
+                    setBusy(false);
+                }
+            }
+        }
+
+        function startDogCountdown(secs) {
+            clearDogCountdown();
+            const btn = document.getElementById("bDog");
+            btn.classList.add("active");
+            let remaining = secs;
+            function tick() {
+                if (remaining <= 0) {
+                    clearDogCountdown();
+                    return;
+                }
+                const m = Math.floor(remaining / 60);
+                const s = String(remaining % 60).padStart(2, "0");
+                btn.textContent = `🐕 SUSPENDED — ${m}:${s} remaining (tap to cancel)`;
+                remaining--;
+            }
+            tick();
+            dogCountdownInterval = setInterval(tick, 1000);
+        }
+
+        function clearDogCountdown() {
+            if (dogCountdownInterval) {
+                clearInterval(dogCountdownInterval);
+                dogCountdownInterval = null;
+            }
+            const btn = document.getElementById("bDog");
+            btn.classList.remove("active");
+            btn.textContent = "🐕 DOG DOOR (10 min)";
         }
 
         async function poll() {
@@ -197,6 +257,17 @@
             const nl = document.getElementById("bNL");
             nl.classList.toggle("on", d.night_light);
             nl.textContent = d.night_light ? "NIGHT LIGHT (ON)" : "NIGHT LIGHT";
+
+            // Dog Door button: only visible in night/silent_night mode
+            const dog = document.getElementById("bDog");
+            const nightMode = d.mode === "night" || d.mode === "silent_night";
+            dog.classList.toggle("visible", nightMode);
+            // Sync countdown from server if suspended and no local countdown running
+            if (d.suspended_secs > 0 && !dogCountdownInterval) {
+                startDogCountdown(d.suspended_secs);
+            } else if (d.suspended_secs === 0 && dogCountdownInterval) {
+                clearDogCountdown();
+            }
 
             if (d.last_sensor_name) {
                 document.getElementById("sName").textContent = d.last_sensor_name;
