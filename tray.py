@@ -33,7 +33,7 @@ from zeroconf import ServiceInfo, Zeroconf
 
 from server import (
     app, state, connect_hub, connect_camera, start_monitor_thread,
-    stop_monitor_thread, get_local_ip,
+    stop_monitor_thread, start_reconnect_thread, get_local_ip,
 )
 
 PORT = 5000
@@ -170,6 +170,7 @@ def setup(icon):
         else:
             icon.title = "AGSHome — connection failed"
         start_monitor_thread()
+        start_reconnect_thread()
         logger.info(f"Server ready at http://{MDNS_NAME}.local:{PORT}")
 
     threading.Thread(target=_startup, daemon=True).start()

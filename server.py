@@ -15,7 +15,7 @@ import os
 import socket
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from flask import Flask, jsonify, render_template, Response
@@ -73,6 +73,8 @@ class AppState:
         self._monitor_running = False
         self._monitor_thread: Optional[threading.Thread] = None
         self.suspended_until: Optional[float] = None  # epoch time when suspension ends
+        self.reconnect_hour: int = 15                  # hour of day for daily reconnect
+        self._reconnect_in_progress: bool = False      # guard against concurrent reconnects
 
 
 state = AppState()
@@ -218,11 +220,16 @@ def connect_camera():
 # ============================================================
 
 def _monitor_loop():
-    """Background thread: poll hub for async events."""
+    """Background thread: poll hub for async events and detect mid-session failures."""
     while state._monitor_running:
         if state.hub and state.hub_connected and state.hub._device:
             try:
                 events = state.hub.monitor_check_async()
+                # Detect mid-session 914: hub.py sets _device=None on 914
+                if state.hub._device is None:
+                    with state.lock:
+                        state.hub_connected = False
+                    _trigger_reconnect()
                 for event in events:
                     if event["type"] == "sensor":
                         with state.lock:
@@ -243,7 +250,7 @@ def _monitor_loop():
                             state.night_light = dps[DPS_SIREN]
             except Exception:
                 pass
-        time.sleep(0.3)
+        time.sleep(1.0)
 
 
 def start_monitor_thread():
@@ -262,11 +269,93 @@ def stop_monitor_thread():
 
 
 # ============================================================
-# Hub Connection
+# Hub Connection + Watchdog
 # ============================================================
 
+def connect_hub_with_retry(max_minutes: int = 5) -> bool:
+    """Try to connect hub, retrying every 30s for up to max_minutes. Sends ntfy if exhausted."""
+    deadline = time.time() + (max_minutes * 60)
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        logger.info(f"Hub connect attempt {attempt}...")
+        if state.hub and state.hub.connect():
+            state.hub_connected = True
+            status = state.hub.status()
+            if "error" not in status:
+                with state.lock:
+                    state.night_light = status.get(DPS_SIREN, False)
+            return True
+        remaining = int((deadline - time.time()) / 60)
+        logger.warning(f"Hub connect failed — retrying in 30s ({remaining}min remaining)...")
+        time.sleep(30)
+    send_ntfy(
+        "Hub unreachable after 5 min — manual power cycle needed",
+        title="AGSHome Alert",
+        priority=4,
+        tags="warning",
+    )
+    return False
+
+
+def _trigger_reconnect():
+    """Fire-and-forget reconnect after mid-session 914 detection."""
+    if state._reconnect_in_progress:
+        return
+    state._reconnect_in_progress = True
+
+    def _do_reconnect():
+        logger.warning("Hub lost mid-session — attempting recovery...")
+        send_ntfy(
+            "Hub connection lost — attempting reconnect",
+            title="AGSHome Alert",
+            priority=3,
+            tags="warning",
+        )
+        if state.hub:
+            state.hub.disconnect()
+        time.sleep(3)
+        success = connect_hub_with_retry(max_minutes=5)
+        if success:
+            logger.info("Mid-session recovery: hub reconnected")
+            send_ntfy("Hub reconnected", priority=1, tags="white_check_mark")
+        state._reconnect_in_progress = False
+
+    threading.Thread(target=_do_reconnect, daemon=True).start()
+
+
+def _daily_reconnect_loop():
+    """Background thread: gracefully reconnect hub daily at state.reconnect_hour."""
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=state.reconnect_hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_secs = (target - now).total_seconds()
+        logger.info(f"Daily reconnect scheduled in {wait_secs/3600:.1f}h at {target.strftime('%H:%M')}")
+        time.sleep(wait_secs)
+
+        logger.info("Daily reconnect: starting graceful reconnect...")
+        send_ntfy("Daily hub reconnect starting", priority=1, tags="arrows_counterclockwise")
+        if state.hub:
+            state.hub.disconnect()
+        with state.lock:
+            state.hub_connected = False
+        time.sleep(3)
+        success = connect_hub_with_retry(max_minutes=5)
+        if success:
+            logger.info("Daily reconnect: success")
+            send_ntfy("Hub reconnected successfully", priority=1, tags="white_check_mark")
+
+
+def start_reconnect_thread():
+    """Start the daily reconnect watchdog thread."""
+    t = threading.Thread(target=_daily_reconnect_loop, daemon=True)
+    t.start()
+
+
 def connect_hub():
-    """Connect to the hub (called once at startup)."""
+    """Connect to the hub at startup, retrying for up to 5 minutes on failure."""
     _load_ntfy_config()
     config = load_config()
     hub = create_hub(config)
@@ -274,16 +363,14 @@ def connect_hub():
         logger.error("No hub configured (check config.json / devices.json)")
         return
 
+    state.hub = hub
+    state.reconnect_hour = config.get("hub", {}).get("reconnect_hour", 15)
     logger.info(f"Connecting to hub at {hub.ip_address}...")
-    if hub.connect():
-        state.hub = hub
-        state.hub_connected = True
-        status = hub.status()
-        if "error" not in status:
-            state.night_light = status.get(DPS_SIREN, False)
+    connect_hub_with_retry(max_minutes=5)
+    if state.hub_connected:
         logger.info(f"Hub connected at {hub.ip_address}")
     else:
-        logger.error("Hub connection failed")
+        logger.error("Hub connection failed after retries")
 
 
 def get_local_ip() -> str:
@@ -553,6 +640,7 @@ if __name__ == "__main__":
     connect_hub()
     connect_camera()
     start_monitor_thread()
+    start_reconnect_thread()
     local_ip = get_local_ip()
     print(f"\n  Phone:   http://agshome.local:5000")
     print(f"  Desktop: http://agshome.local:5000/desktop")

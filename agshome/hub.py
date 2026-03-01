@@ -129,6 +129,13 @@ class AGSHomeHub:
         """Check if we have an active device handle."""
         return self._device is not None
 
+    def reconnect(self) -> bool:
+        """Gracefully disconnect and reconnect. Returns True on success."""
+        logger.info("Hub: graceful reconnect starting...")
+        self.disconnect()
+        time.sleep(3)
+        return self.connect()
+
     # --- Status ---
 
     def status(self) -> dict:
@@ -356,10 +363,13 @@ class AGSHomeHub:
 
     def monitor_check_async(self) -> list[dict]:
         """
-        Check for async events from the hub and handle monitor logic.
+        Poll the hub for state changes and handle monitor logic.
+
+        Uses status() polling rather than receive() so it works without
+        a persistent socket connection (which causes 914 errors on this hub).
 
         Returns a list of event dicts: [{"type": str, "message": str, "dps": dict}]
-        Call this frequently (every 200-500ms) for responsive monitoring.
+        Call this frequently (every 500ms-1s) for responsive monitoring.
         """
         self.__init_monitor_state()
         events = []
@@ -368,38 +378,42 @@ class AGSHomeHub:
             return events
 
         try:
-            self._device.set_socketTimeout(0.1)
-            data = self._device.receive()
-            if not data or not isinstance(data, dict):
+            result = self._device.status()
+            if not result or not isinstance(result, dict):
+                return events
+            if "Error" in result or "Err" in result:
+                if result.get("Err") == "914":
+                    logger.warning("Monitor: hub returned 914 — marking disconnected for recovery")
+                    self._device = None
                 return events
 
-            dps = data.get("dps", {})
-            if not dps and "data" in data:
-                dps = data["data"].get("dps", {})
+            dps = result.get("dps", {})
+            if not dps and "data" in result:
+                dps = result["data"].get("dps", {})
             if not dps:
                 return events
 
-            logger.debug(f"Async DPS received: {dps}")
+            logger.debug(f"Polled DPS: {dps}")
 
-            # Sensor event (DPS 116 — may or may not arrive via async)
+            # Sensor event (DPS 116)
             if DPS_SENSOR_EVENT in dps:
                 sensor_name = decode_utf16_base64(dps[DPS_SENSOR_EVENT])
                 events.append({"type": "sensor", "message": sensor_name, "dps": dps})
                 logger.info(f"Monitor: sensor event — {sensor_name}")
                 self._notify_monitor("sensor", sensor_name)
 
-            # Notification (DPS 121 — often contains sensor name)
+            # Notification (DPS 121)
             if DPS_NOTIFICATION in dps:
                 notification = decode_utf16_base64(dps[DPS_NOTIFICATION])
                 events.append({"type": "notification", "message": notification, "dps": dps})
 
-            # Alarm triggered (DPS 103) — primary trigger for monitor re-arm
+            # Alarm triggered (DPS 103) — detect rising edge only (False→True)
             if DPS_ALARM_TRIGGERED in dps:
                 triggered = dps[DPS_ALARM_TRIGGERED]
+                prev_triggered = self._last_status.get(DPS_ALARM_TRIGGERED, False)
                 events.append({"type": "triggered", "message": str(triggered), "dps": dps})
 
-                # In monitor mode: silence siren and re-arm in background thread
-                if triggered and self._monitor_active and not self._monitor_rearming:
+                if triggered and not prev_triggered and self._monitor_active and not self._monitor_rearming:
                     threading.Thread(
                         target=self._monitor_rearm_sequence,
                         daemon=True,
@@ -408,7 +422,14 @@ class AGSHomeHub:
             # Mode change
             if DPS_ALARM_MODE in dps:
                 mode_val = dps[DPS_ALARM_MODE]
-                events.append({"type": "mode", "message": mode_val, "dps": dps})
+                if mode_val != self._last_status.get(DPS_ALARM_MODE):
+                    events.append({"type": "mode", "message": mode_val, "dps": dps})
+
+            # Siren / night light state (DPS 104)
+            if DPS_SIREN in dps:
+                events.append({"type": "siren", "message": str(dps[DPS_SIREN]), "dps": dps})
+
+            self._last_status = dps
 
         except Exception:
             pass
