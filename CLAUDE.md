@@ -55,6 +55,35 @@ python dashboard.py --headless           # Headless monitoring mode
 - `agshome/` package provides hub control (hub.py) and DPS mapping (dps_map.py)
 - Monitor mode: two re-arm strategies — silent (direct DPS writes, no beeps) and normal (disarm/re-arm cycle, hub beeps)
 
+## Raspberry Pi Deployment
+
+The production service runs on a Raspberry Pi on the local network.
+
+- **Hostname:** `agshome` (192.168.0.56)
+- **User:** `pi`
+- **Install path:** `/home/pi/agshome/`
+- **Service name:** `agshome` (systemd)
+
+### Deploy commands (run from `e:\Vibe Coding\Alarm\` on Windows)
+
+```bash
+scp agshome/hub.py pi@agshome:/home/pi/agshome/agshome/hub.py
+scp server.py pi@agshome:/home/pi/agshome/server.py
+```
+
+### Restart service (in SSH session on Pi)
+
+```bash
+sudo systemctl restart agshome
+```
+
+### View logs (in SSH session on Pi)
+
+```bash
+sudo journalctl -u agshome -n 100 --no-pager
+sudo journalctl -u agshome -f          # live tail
+```
+
 ## Network Requirements
 
 - UDP 6666, 6667, 7000 (Tuya discovery)

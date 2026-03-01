@@ -8,156 +8,580 @@
     <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <title>AGSHome</title>
     <style>
         :root {
-            --bg: #1a1a2e;
-            --card: #16213e;
-            --text: #e0e0e0;
-            --dim: #8892a0;
-            --accent: #00d2ff;
-            --green: #44cc44;
-            --amber: #dd8800;
-            --purple: #6644cc;
-            --yellow: #ccaa00;
-            --grey: #444466;
-            --red: #ff4444;
-            --teal: #008888;
+            --bg:        #0d0d0f;
+            --surface:   #131316;
+            --raised:    #1c1c21;
+            --border:    #2a2a32;
+            --dim:       #4a4a5a;
+            --text:      #c8c8d8;
+            --bright:    #eeeef8;
+
+            /* Mode accent colours */
+            --c-disarm:  #2ecc6e;
+            --c-away:    #e83a3a;
+            --c-night:   #7c5cbf;
+            --c-day:     #d4860a;
+            --c-silent:  #0e8f8f;
+            --c-dog:     #2a7a45;
+            --c-default: #4a4a5a;
+
+            --current-accent: var(--c-default);
+            --glow-rgb: 74, 74, 90;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
 
+        html, body {
+            height: 100%;
+            overflow-x: hidden;
+        }
+
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-family: 'IBM Plex Mono', monospace;
             background: var(--bg);
             color: var(--text);
             min-height: 100dvh;
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
-            padding: 24px 16px;
+            justify-content: flex-start;
+            padding: 0 0 32px;
             -webkit-tap-highlight-color: transparent;
+            position: relative;
         }
 
+        /* Grain overlay */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 0;
+            opacity: 0.6;
+        }
+
+        /* Ambient glow behind status */
+        .glow-orb {
+            position: fixed;
+            top: -80px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 320px;
+            height: 320px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(var(--glow-rgb), 0.18) 0%, transparent 70%);
+            pointer-events: none;
+            z-index: 0;
+            transition: background 0.8s ease;
+        }
+
+        /* ── Header ─────────────────────────────────── */
         .header {
-            text-align: center;
-            margin-bottom: 24px;
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 420px;
+            padding: 32px 24px 0;
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
         }
 
-        .header h1 {
-            font-size: 1.3rem;
-            color: var(--accent);
-            letter-spacing: 0.05em;
+        .wordmark {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.6rem;
+            letter-spacing: 0.12em;
+            color: var(--bright);
+            line-height: 1;
         }
 
-        .conn {
-            font-size: 0.8rem;
+        .wordmark span {
+            color: var(--current-accent);
+            transition: color 0.6s ease;
+        }
+
+        .conn-dot {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.65rem;
+            letter-spacing: 0.1em;
             color: var(--dim);
-            margin-top: 4px;
+            text-transform: uppercase;
         }
-        .conn.ok { color: var(--green); }
-        .conn.fail { color: var(--red); }
 
-        .mode-badge {
-            font-size: 1.5rem;
-            font-weight: 700;
-            padding: 14px 24px;
-            border-radius: 14px;
-            background: var(--card);
-            text-align: center;
+        .conn-dot::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--dim);
+            transition: background 0.4s, box-shadow 0.4s;
+            flex-shrink: 0;
+        }
+
+        .conn-dot.ok { color: var(--c-disarm); }
+        .conn-dot.ok::before {
+            background: var(--c-disarm);
+            box-shadow: 0 0 8px var(--c-disarm);
+            animation: pulse-dot 2s ease-in-out infinite;
+        }
+        .conn-dot.fail { color: var(--c-away); }
+        .conn-dot.fail::before { background: var(--c-away); box-shadow: 0 0 8px var(--c-away); }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* ── Status Panel ────────────────────────────── */
+        .status-panel {
+            position: relative;
+            z-index: 1;
             width: 100%;
-            max-width: 340px;
-            margin-bottom: 24px;
-            transition: color 0.2s;
+            max-width: 420px;
+            padding: 24px 24px 0;
+            margin-top: 20px;
         }
 
-        .buttons {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
+        .status-display {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 20px 24px 18px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* Scanline effect */
+        .status-display::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 3px,
+                rgba(0,0,0,0.08) 3px,
+                rgba(0,0,0,0.08) 4px
+            );
+            pointer-events: none;
+        }
+
+        .status-label {
+            font-size: 0.6rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--dim);
+            margin-bottom: 6px;
+        }
+
+        .status-mode {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 3.2rem;
+            letter-spacing: 0.08em;
+            color: var(--current-accent);
+            line-height: 0.95;
+            transition: color 0.5s ease;
+            min-height: 3rem;
+        }
+
+        .status-bar {
+            height: 2px;
+            background: var(--border);
+            border-radius: 1px;
+            margin-top: 14px;
+            overflow: hidden;
+        }
+
+        .status-bar-fill {
+            height: 100%;
+            width: 100%;
+            background: var(--current-accent);
+            border-radius: 1px;
+            transition: background 0.6s ease;
+            opacity: 0.6;
+        }
+
+        /* ── Sensor Card ─────────────────────────────── */
+        .sensor-strip {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 420px;
+            padding: 12px 24px 0;
+        }
+
+        .sensor-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
             gap: 12px;
-            width: 100%;
-            max-width: 340px;
-            margin-bottom: 28px;
         }
+
+        .sensor-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 3px;
+            background: var(--raised);
+            border: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            flex-shrink: 0;
+            color: var(--dim);
+        }
+
+        .sensor-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .sensor-label {
+            font-size: 0.55rem;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--dim);
+            margin-bottom: 2px;
+        }
+
+        .sensor-name {
+            font-size: 0.8rem;
+            color: var(--current-accent);
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            transition: color 0.5s;
+        }
+
+        .sensor-time {
+            font-size: 0.65rem;
+            color: var(--dim);
+            letter-spacing: 0.05em;
+            flex-shrink: 0;
+        }
+
+        /* ── Button Grid ─────────────────────────────── */
+        .controls {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 420px;
+            padding: 20px 24px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .btn-row {
+            display: grid;
+            gap: 10px;
+        }
+
+        .btn-row.cols-2 { grid-template-columns: 1fr 1fr; }
+        .btn-row.cols-1 { grid-template-columns: 1fr; }
 
         .btn {
-            padding: 22px 12px;
-            border: 3px solid transparent;
-            border-radius: 16px;
-            font-size: 0.95rem;
-            font-weight: 700;
-            color: white;
+            position: relative;
+            padding: 0;
+            border: none;
+            border-radius: 4px;
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.25rem;
+            letter-spacing: 0.12em;
+            color: var(--bright);
             cursor: pointer;
-            transition: border-color 0.15s, transform 0.1s, opacity 0.1s;
             -webkit-user-select: none;
             user-select: none;
             text-align: center;
+            background: transparent;
+            overflow: hidden;
+            transition: transform 0.08s ease, opacity 0.15s;
+            -webkit-tap-highlight-color: transparent;
+            outline: none;
         }
-        .btn:active { transform: scale(0.95); opacity: 0.8; }
-        .btn.active { border-color: var(--accent); box-shadow: 0 0 16px rgba(0, 210, 255, 0.25); }
-        .btn:disabled { opacity: 0.4; cursor: default; transform: none; }
 
-        .btn-disarm  { background: var(--green); grid-column: span 2; }
-        .btn-away    { background: var(--red); grid-column: span 2; }
-        .btn-day     { background: var(--amber); }
-        .btn-night   { background: var(--purple); }
-        .btn-silent  { background: var(--teal); grid-column: span 2; }
-        .btn-nl      { background: var(--grey); grid-column: span 2; }
-        .btn-nl.on   { background: var(--yellow); }
-        .btn-dog     { background: #2e6b3e; grid-column: span 2; display: none; }
-        .btn-dog.active { background: #1a4a2a; border-color: var(--accent); }
-        .btn-dog.visible { display: block; }
-
-        .sensor {
-            background: var(--card);
-            border-radius: 14px;
-            padding: 16px 20px;
-            width: 100%;
-            max-width: 340px;
-            text-align: center;
+        .btn-inner {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 18px 12px 16px;
+            background: var(--raised);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            border-bottom: 3px solid rgba(0,0,0,0.5);
+            transition: background 0.2s, border-color 0.2s, box-shadow 0.2s, border-bottom-width 0.08s;
+            gap: 3px;
         }
-        .sensor .label { font-size: 0.75rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em; }
-        .sensor .name  { font-size: 1.05rem; color: var(--accent); margin-top: 4px; }
-        .sensor .time  { font-size: 0.75rem; color: var(--dim); margin-top: 2px; }
+
+        .btn-sub {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.5rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--dim);
+            display: block;
+        }
+
+        /* Colour-coded left accent strip */
+        .btn::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 3px;
+            width: 3px;
+            border-radius: 4px 0 0 4px;
+            background: var(--btn-accent, var(--border));
+            transition: background 0.2s;
+            z-index: 1;
+        }
+
+        /* Active / selected state */
+        .btn.active .btn-inner {
+            background: color-mix(in srgb, var(--btn-accent, var(--border)) 15%, var(--raised));
+            border-color: var(--btn-accent, var(--border));
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.2), 0 0 12px color-mix(in srgb, var(--btn-accent, transparent) 30%, transparent);
+        }
+
+        .btn.active .btn-sub { color: var(--btn-accent, var(--dim)); }
+
+        /* Press effect */
+        .btn:active { transform: scale(0.975); }
+        .btn:active .btn-inner {
+            border-bottom-width: 1px;
+            transform: translateY(2px);
+        }
+
+        .btn:disabled { opacity: 0.35; cursor: default; transform: none; }
+        .btn:disabled .btn-inner { transform: none; }
+
+        /* Individual button accents */
+        .btn-disarm { --btn-accent: var(--c-disarm); }
+        .btn-away   { --btn-accent: var(--c-away); }
+        .btn-night  { --btn-accent: var(--c-night); }
+        .btn-day    { --btn-accent: var(--c-day); }
+        .btn-silent { --btn-accent: var(--c-silent); }
+        .btn-dog    { --btn-accent: var(--c-dog); }
+        .btn-nl     { --btn-accent: var(--c-day); }
+
+        /* Dog door hidden by default */
+        .btn-dog-wrap { display: none; }
+        .btn-dog-wrap.visible { display: block; }
+
+        /* Night light ON state */
+        .btn-nl.nl-on .btn-inner {
+            background: color-mix(in srgb, var(--c-day) 12%, var(--raised));
+            border-color: var(--c-day);
+        }
+        .btn-nl.nl-on .btn-sub { color: var(--c-day); }
+
+        /* Divider */
+        .divider {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 0 2px;
+        }
+        .divider-line {
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+        .divider-text {
+            font-size: 0.55rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--dim);
+        }
+
+        /* ── Alert flash overlay ─────────────────────── */
+        #alert-flash {
+            position: fixed;
+            inset: 0;
+            background: var(--c-away);
+            opacity: 0;
+            pointer-events: none;
+            z-index: 999;
+            animation: none;
+        }
+
+        @keyframes flash-seq {
+            0%   { opacity: 0; }
+            15%  { opacity: 0.35; }
+            30%  { opacity: 0; }
+            45%  { opacity: 0.25; }
+            60%  { opacity: 0; }
+            75%  { opacity: 0.15; }
+            100% { opacity: 0; }
+        }
+
+        .flashing { animation: flash-seq 1s ease-out forwards; }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>AGSHome</h1>
-        <div class="conn" id="conn">connecting...</div>
-    </div>
+    <div class="glow-orb" id="glowOrb"></div>
+    <div id="alert-flash"></div>
 
-    <div class="mode-badge" id="mode">---</div>
+    <!-- Header -->
+    <header class="header">
+        <div class="wordmark">AGS<span>HOME</span></div>
+        <div class="conn-dot" id="conn">connecting...</div>
+    </header>
 
-    <div class="buttons">
-        <button class="btn btn-disarm" id="bDisarm" onclick="cmd('disarm')">DISARM</button>
-        <button class="btn btn-away"   id="bAway"   onclick="cmd('away')">AWAY</button>
-        <button class="btn btn-day"    id="bDay"    onclick="cmd('day')">DAY</button>
-        <button class="btn btn-night"  id="bNight"  onclick="cmd('night')">NIGHT</button>
-        <button class="btn btn-silent" id="bSilent" onclick="cmd('silent_night')">SILENT NIGHT</button>
-        <button class="btn btn-nl"     id="bNL"     onclick="cmd('nightlight')">NIGHT LIGHT</button>
-        <button class="btn btn-dog"    id="bDog"    onclick="dogDoor()">🐕 DOG DOOR</button>
-    </div>
+    <!-- Status Display -->
+    <section class="status-panel">
+        <div class="status-display">
+            <div class="status-label">System Status</div>
+            <div class="status-mode" id="mode">---</div>
+            <div class="status-bar"><div class="status-bar-fill"></div></div>
+        </div>
+    </section>
 
-    <div class="sensor">
-        <div class="label">Last Sensor</div>
-        <div class="name" id="sName">--</div>
-        <div class="time" id="sTime"></div>
-    </div>
+    <!-- Last Sensor -->
+    <section class="sensor-strip">
+        <div class="sensor-card">
+            <div class="sensor-icon">&#9632;</div>
+            <div class="sensor-info">
+                <div class="sensor-label">Last Sensor</div>
+                <div class="sensor-name" id="sName">--</div>
+            </div>
+            <div class="sensor-time" id="sTime"></div>
+        </div>
+    </section>
+
+    <!-- Controls -->
+    <section class="controls">
+
+        <!-- Disarm -->
+        <div class="btn-row cols-1">
+            <button class="btn btn-disarm" id="bDisarm" onclick="cmd('disarm')">
+                <div class="btn-inner">
+                    DISARM
+                    <span class="btn-sub">deactivate all zones</span>
+                </div>
+            </button>
+        </div>
+
+        <div class="divider">
+            <div class="divider-line"></div>
+            <div class="divider-text">Arm</div>
+            <div class="divider-line"></div>
+        </div>
+
+        <!-- Away + Night -->
+        <div class="btn-row cols-2">
+            <button class="btn btn-away" id="bAway" onclick="cmd('away')">
+                <div class="btn-inner">
+                    AWAY
+                    <span class="btn-sub">full siren</span>
+                </div>
+            </button>
+            <button class="btn btn-night" id="bNight" onclick="cmd('night')">
+                <div class="btn-inner">
+                    NIGHT
+                    <span class="btn-sub">30s then rearm</span>
+                </div>
+            </button>
+        </div>
+
+        <!-- Day + Silent Night -->
+        <div class="btn-row cols-2">
+            <button class="btn btn-day" id="bDay" onclick="cmd('day')">
+                <div class="btn-inner">
+                    DAY
+                    <span class="btn-sub">ntfy only</span>
+                </div>
+            </button>
+            <button class="btn btn-silent" id="bSilent" onclick="cmd('silent_night')">
+                <div class="btn-inner">
+                    SILENT
+                    <span class="btn-sub">no siren</span>
+                </div>
+            </button>
+        </div>
+
+        <div class="divider">
+            <div class="divider-line"></div>
+            <div class="divider-text">Options</div>
+            <div class="divider-line"></div>
+        </div>
+
+        <!-- Night Light -->
+        <div class="btn-row cols-1">
+            <button class="btn btn-nl" id="bNL" onclick="cmd('nightlight')">
+                <div class="btn-inner">
+                    NIGHT LIGHT
+                    <span class="btn-sub">hub LED toggle</span>
+                </div>
+            </button>
+        </div>
+
+        <!-- Dog Door (conditionally shown) -->
+        <div class="btn-dog-wrap" id="dogWrap">
+            <div class="btn-row cols-1">
+                <button class="btn btn-dog" id="bDog" onclick="dogDoor()">
+                    <div class="btn-inner">
+                        <span id="dogLabel">DOG DOOR</span>
+                        <span class="btn-sub" id="dogSub">suspend night mode</span>
+                    </div>
+                </button>
+            </div>
+        </div>
+
+    </section>
 
     <script>
-        const LABELS = { disarmed: "DISARMED", away: "AWAY", day: "DAY MONITOR", night: "NIGHT MONITOR", silent_night: "SILENT NIGHT", dog_door: "DOG DOOR" };
-        const COLOURS = { disarmed: "#44cc44", away: "#ff4444", day: "#dd8800", night: "#6644cc", silent_night: "#008888", dog_door: "#2e6b3e" };
+        const LABELS = {
+            disarmed:     'DISARMED',
+            away:         'AWAY',
+            day:          'DAY',
+            night:        'NIGHT',
+            silent_night: 'SILENT',
+            dog_door:     'DOG DOOR',
+        };
+
+        const MODE_ACCENT = {
+            disarmed:     'var(--c-disarm)',
+            away:         'var(--c-away)',
+            night:        'var(--c-night)',
+            day:          'var(--c-day)',
+            silent_night: 'var(--c-silent)',
+            dog_door:     'var(--c-dog)',
+        };
+
+        const GLOW_RGB = {
+            disarmed:     '46, 204, 110',
+            away:         '232, 58, 58',
+            night:        '124, 92, 191',
+            day:          '212, 134, 10',
+            silent_night: '14, 143, 143',
+            dog_door:     '42, 122, 69',
+        };
+
         let busy = false;
-        let lastAlertSeq = -1;  // tracks server alert_seq to detect new triggers
+        let lastAlertSeq = -1;
+        let currentMode = '';
 
         async function cmd(action) {
             if (busy) return;
             busy = true;
             setBusy(true);
             try {
-                const r = await fetch("/api/" + action, { method: "POST" });
+                const r = await fetch('/api/' + action, { method: 'POST' });
                 if (!r.ok) console.error(await r.text());
                 await poll();
             } catch (e) {
@@ -169,7 +593,7 @@
         }
 
         function setBusy(on) {
-            document.querySelectorAll(".btn").forEach(b => b.disabled = on);
+            document.querySelectorAll('.btn').forEach(b => b.disabled = on);
         }
 
         async function dogDoor() {
@@ -177,10 +601,9 @@
             busy = true;
             setBusy(true);
             try {
-                const btn = document.getElementById("bDog");
-                const isActive = btn.classList.contains("active");
-                const endpoint = isActive ? "/api/suspend/cancel" : "/api/suspend";
-                await fetch(endpoint, { method: "POST" });
+                const isActive = currentMode === 'dog_door';
+                const endpoint = isActive ? '/api/suspend/cancel' : '/api/suspend';
+                await fetch(endpoint, { method: 'POST' });
                 await poll();
             } catch (e) {
                 console.error(e);
@@ -192,57 +615,76 @@
 
         async function poll() {
             try {
-                const r = await fetch("/api/status");
+                const r = await fetch('/api/status');
                 const d = await r.json();
                 render(d);
             } catch {
-                document.getElementById("conn").textContent = "offline";
-                document.getElementById("conn").className = "conn fail";
+                const conn = document.getElementById('conn');
+                conn.textContent = 'offline';
+                conn.className = 'conn-dot fail';
             }
         }
 
         function render(d) {
-            const conn = document.getElementById("conn");
-            conn.textContent = d.hub_connected ? "connected" : "disconnected";
-            conn.className = "conn " + (d.hub_connected ? "ok" : "fail");
+            currentMode = d.mode;
 
-            const mode = document.getElementById("mode");
-            const modeKey = d.dog_door_active ? "dog_door" : d.mode;
-            mode.textContent = LABELS[modeKey] || d.mode;
-            mode.style.color = COLOURS[modeKey] || "#e0e0e0";
+            // Connection indicator
+            const conn = document.getElementById('conn');
+            conn.textContent = d.hub_connected ? 'online' : 'offline';
+            conn.className = 'conn-dot ' + (d.hub_connected ? 'ok' : 'fail');
 
-            document.getElementById("bDisarm").classList.toggle("active", d.mode === "disarmed");
-            document.getElementById("bAway").classList.toggle("active", d.mode === "away");
-            document.getElementById("bDay").classList.toggle("active", d.mode === "day");
-            document.getElementById("bNight").classList.toggle("active", d.mode === "night");
-            document.getElementById("bSilent").classList.toggle("active", d.mode === "silent_night");
+            // Mode display
+            const modeEl = document.getElementById('mode');
+            modeEl.textContent = LABELS[d.mode] || d.mode.toUpperCase();
 
-            const nl = document.getElementById("bNL");
-            nl.classList.toggle("on", d.night_light);
-            nl.textContent = d.night_light ? "NIGHT LIGHT (ON)" : "NIGHT LIGHT";
+            // Accent colour cascade (CSS custom property on root)
+            const accent = MODE_ACCENT[d.mode] || 'var(--c-default)';
+            const glowRgb = GLOW_RGB[d.mode] || '74, 74, 90';
+            document.documentElement.style.setProperty('--current-accent', accent);
+            document.documentElement.style.setProperty('--glow-rgb', glowRgb);
 
-            // Dog Door button: visible in night/silent_night, or when dog door is active
-            const dog = document.getElementById("bDog");
-            const nightMode = d.mode === "night" || d.mode === "silent_night";
-            dog.classList.toggle("visible", nightMode || d.dog_door_active);
-            dog.classList.toggle("active", !!d.dog_door_active);
-            dog.textContent = d.dog_door_active ? "🐕 SUSPENDED — tap to re-arm" : "🐕 DOG DOOR";
+            // Button active states
+            document.getElementById('bDisarm').classList.toggle('active', d.mode === 'disarmed');
+            document.getElementById('bAway').classList.toggle('active', d.mode === 'away');
+            document.getElementById('bDay').classList.toggle('active', d.mode === 'day');
+            document.getElementById('bNight').classList.toggle('active', d.mode === 'night');
+            document.getElementById('bSilent').classList.toggle('active', d.mode === 'silent_night');
 
+            // Night light
+            const nl = document.getElementById('bNL');
+            nl.classList.toggle('nl-on', d.night_light);
+            document.querySelector('#bNL .btn-inner').childNodes[0].textContent =
+                d.night_light ? 'LIGHT ON' : 'NIGHT LIGHT';
+            document.querySelector('#bNL .btn-sub').textContent =
+                d.night_light ? 'tap to turn off' : 'hub LED toggle';
+
+            // Dog Door visibility
+            const dogWrap = document.getElementById('dogWrap');
+            const dogActive = d.mode === 'dog_door';
+            dogWrap.classList.toggle('visible', d.mode === 'night' || dogActive);
+            document.getElementById('bDog').classList.toggle('active', dogActive);
+            document.getElementById('dogLabel').textContent = dogActive ? 'RESUME NIGHT' : 'DOG DOOR';
+            document.getElementById('dogSub').textContent = dogActive ? 'tap to rearm night mode' : 'suspend night mode';
+
+            // Sensor
             if (d.last_sensor_name) {
-                document.getElementById("sName").textContent = d.last_sensor_name;
-                document.getElementById("sTime").textContent = d.last_sensor_time || "";
+                document.getElementById('sName').textContent = d.last_sensor_name;
+                document.getElementById('sTime').textContent = d.last_sensor_time || '';
             }
 
-            // Vibrate + notify on new sensor trigger in silent_night mode
+            // Phone alert on new trigger in silent modes
             if (d.alert_seq !== undefined && lastAlertSeq >= 0
-                && d.alert_seq > lastAlertSeq && d.mode === "silent_night") {
+                && d.alert_seq > lastAlertSeq
+                && (d.mode === 'silent_night' || d.mode === 'dog_door' || d.mode === 'day')) {
                 triggerPhoneAlert(d.last_sensor_name);
             }
             if (d.alert_seq !== undefined) lastAlertSeq = d.alert_seq;
         }
 
-        // Audio context for alert tone (works without user gesture from timers)
+        // ── Audio / Alert ──────────────────────────────────────────────
+
         let audioCtx = null;
+
         function ensureAudio() {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             return audioCtx;
@@ -251,54 +693,46 @@
         function playAlertTone() {
             try {
                 const ctx = ensureAudio();
-                // Three short beeps
-                [0, 0.25, 0.5].forEach(offset => {
+                [0, 0.28, 0.56].forEach(offset => {
                     const osc = ctx.createOscillator();
                     const gain = ctx.createGain();
                     osc.connect(gain);
                     gain.connect(ctx.destination);
                     osc.frequency.value = 880;
-                    osc.type = "square";
+                    osc.type = 'square';
                     gain.gain.value = 0.3;
                     osc.start(ctx.currentTime + offset);
-                    osc.stop(ctx.currentTime + offset + 0.15);
+                    osc.stop(ctx.currentTime + offset + 0.18);
                 });
             } catch (e) {
-                console.warn("Audio alert failed:", e);
+                console.warn('Audio alert failed:', e);
             }
         }
 
         function triggerPhoneAlert(sensor) {
-            // Audio beep (works from timer callbacks)
             playAlertTone();
-            // Vibrate (best-effort — may be blocked without user gesture)
-            if (navigator.vibrate) {
-                navigator.vibrate([400, 200, 400, 200, 400]);
-            }
-            // Browser notification
-            if ("Notification" in window && Notification.permission === "granted") {
-                new Notification("AGSHome — Sensor triggered", {
-                    body: sensor,
-                    icon: "/static/icon-192.png",
-                    tag: "agshome-alert",  // replaces previous, avoids stacking
+            if (navigator.vibrate) navigator.vibrate([400, 200, 400, 200, 400]);
+            if ('Notification' in window && Notification.permission === 'granted') {
+                new Notification('AGSHome — Sensor triggered', {
+                    body: sensor || 'Sensor triggered',
+                    icon: '/static/icon-192.png',
+                    tag: 'agshome-alert',
                     renotify: true,
                 });
             }
-            // Visual flash
-            document.body.style.background = "#ff4444";
-            setTimeout(() => { document.body.style.background = ""; }, 300);
-            setTimeout(() => { document.body.style.background = "#ff4444"; }, 600);
-            setTimeout(() => { document.body.style.background = ""; }, 900);
+            const flash = document.getElementById('alert-flash');
+            flash.classList.remove('flashing');
+            void flash.offsetWidth; // reflow to restart animation
+            flash.classList.add('flashing');
         }
 
-        // Unlock audio context + request notification permission on first tap
-        document.addEventListener("click", function initPerms() {
+        // Unlock audio + request notification permission on first tap
+        document.addEventListener('click', function initPerms() {
             ensureAudio();
-            if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
-            if ("Notification" in window && Notification.permission === "default") {
+            if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+            if ('Notification' in window && Notification.permission === 'default') {
                 Notification.requestPermission();
             }
-            document.removeEventListener("click", initPerms);
         }, { once: true });
 
         setInterval(poll, 1500);
