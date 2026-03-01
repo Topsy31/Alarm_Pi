@@ -220,16 +220,14 @@ def connect_camera():
 # ============================================================
 
 def _monitor_loop():
-    """Background thread: poll hub for async events and detect mid-session failures."""
+    """Background thread: receive async hub push events (DPS 116 sensor names etc)."""
+    health_check_interval = 30  # seconds between status() health checks
+    last_health_check = time.time()
+
     while state._monitor_running:
         if state.hub and state.hub_connected and state.hub._device:
             try:
                 events = state.hub.monitor_check_async()
-                # Detect mid-session 914: hub.py sets _device=None on 914
-                if state.hub._device is None:
-                    with state.lock:
-                        state.hub_connected = False
-                    _trigger_reconnect()
                 for event in events:
                     if event["type"] == "sensor":
                         with state.lock:
@@ -248,9 +246,19 @@ def _monitor_loop():
                     if DPS_SIREN in dps:
                         with state.lock:
                             state.night_light = dps[DPS_SIREN]
+
+                # Periodic health check via status() to detect 914 lockout
+                now = time.time()
+                if now - last_health_check >= health_check_interval:
+                    last_health_check = now
+                    if not state.hub.health_check():
+                        with state.lock:
+                            state.hub_connected = False
+                        _trigger_reconnect()
+
             except Exception:
                 pass
-        time.sleep(1.0)
+        time.sleep(0.3)
 
 
 def start_monitor_thread():
