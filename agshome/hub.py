@@ -46,6 +46,7 @@ class AGSHomeHub:
         self.local_key = local_key
         self.version = version
         self._device: Optional[tinytuya.Device] = None
+        self._device_lock = threading.Lock()  # serialise all socket access
         self._listeners: list[Callable] = []
         self._last_status: dict = {}
 
@@ -186,25 +187,34 @@ class AGSHomeHub:
 
     def _set_dps(self, index: str, value: Any) -> bool:
         """Send a DPS value to the hub, reconnecting if the session has expired."""
-        if not self._device:
-            logger.error("Not connected")
-            return False
+        with self._device_lock:
+            if not self._device:
+                logger.error("Not connected")
+                return False
+            try:
+                result = self._device.set_value(index, value)
+            except Exception as e:
+                logger.error(f"Failed to set DPS {index}: {e}")
+                return False
 
-        try:
-            result = self._device.set_value(index, value)
-            # Error 914 = session key expired (common with persistent v3.4 connections)
-            if isinstance(result, dict) and result.get("Err") == "914":
-                logger.warning("Session expired (914) — reconnecting and retrying...")
-                if self.connect():
-                    result = self._device.set_value(index, value)
-                else:
-                    logger.error(f"Reconnection failed, could not set DPS {index}")
+        # Error 914 = session key expired — reconnect outside the lock (network call)
+        if isinstance(result, dict) and result.get("Err") == "914":
+            logger.warning("Session expired (914) — reconnecting and retrying...")
+            if not self.connect():
+                logger.error(f"Reconnection failed, could not set DPS {index}")
+                return False
+            # Retry the write on the new connection
+            with self._device_lock:
+                if not self._device:
                     return False
-            logger.info(f"Set DPS {index} = {value} -> {result}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to set DPS {index}: {e}")
-            return False
+                try:
+                    result = self._device.set_value(index, value)
+                except Exception as e:
+                    logger.error(f"Failed to set DPS {index} after reconnect: {e}")
+                    return False
+
+        logger.info(f"Set DPS {index} = {value} -> {result}")
+        return True
 
     # --- Listeners ---
 
@@ -377,8 +387,10 @@ class AGSHomeHub:
             return events
 
         try:
-            self._device.set_socketTimeout(0.1)
-            data = self._device.receive()
+            with self._device_lock:
+                self._device.set_socketTimeout(0.1)
+                data = self._device.receive()
+
             if not data or not isinstance(data, dict):
                 return events
 
@@ -443,7 +455,8 @@ class AGSHomeHub:
         if not self._device:
             return False
         try:
-            result = self._device.status()
+            with self._device_lock:
+                result = self._device.status()
             if isinstance(result, dict) and result.get("Err") == "914":
                 logger.warning("Health check: hub returned 914 — marking disconnected for recovery")
                 self._device = None
@@ -495,34 +508,6 @@ class AGSHomeHub:
             logger.error(f"Monitor re-arm error: {e}")
         finally:
             self._monitor_rearming = False
-
-    def suspend_zones(self) -> bool:
-        """
-        Silently disable all sensor zones — no beep, no siren.
-
-        Used for the Dog Door feature: temporarily suspends monitoring
-        so a door can be opened without triggering the alarm. Call
-        resume_zones() to re-enable.
-
-        Safe to call during monitor mode — does not stop monitoring.
-        """
-        logger.info("Monitor: suspending zones (silent)...")
-        ok1 = self._set_dps(DPS_ZONE_1_ENABLED, False)
-        ok2 = self._set_dps(DPS_ZONE_2_ENABLED, False)
-        self._notify_monitor("info", "Zones suspended (dog door)")
-        return ok1 and ok2
-
-    def resume_zones(self) -> bool:
-        """
-        Silently re-enable all sensor zones — no beep.
-
-        Call after suspend_zones() when the door has been closed.
-        """
-        logger.info("Monitor: resuming zones (silent)...")
-        ok1 = self._set_dps(DPS_ZONE_1_ENABLED, True)
-        ok2 = self._set_dps(DPS_ZONE_2_ENABLED, True)
-        self._notify_monitor("info", "Zones resumed")
-        return ok1 and ok2
 
     # --- Utilities ---
 
