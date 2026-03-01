@@ -33,7 +33,7 @@ from zeroconf import ServiceInfo, Zeroconf
 
 from server import (
     app, state, connect_hub, connect_camera,
-    start_monitor_thread, stop_monitor_thread, get_local_ip,
+    start_monitor_thread, stop_monitor_thread, start_reconnect_thread, get_local_ip,
 )
 
 PORT = 5000
@@ -109,6 +109,7 @@ def main():
     connect_hub()
     connect_camera()
     start_monitor_thread()
+    start_reconnect_thread()
 
     local_ip = get_local_ip()
     logger.info(f"Server ready:")
