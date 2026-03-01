@@ -82,7 +82,6 @@ class AGSHomeHub:
                 local_key=self.local_key,
                 version=self.version,
             )
-            device.set_socketPersistent(True)
             result = device.status()
 
             if "Error" in result or "Err" in result:
@@ -179,13 +178,21 @@ class AGSHomeHub:
         return self._set_dps(index, value)
 
     def _set_dps(self, index: str, value: Any) -> bool:
-        """Send a DPS value to the hub."""
+        """Send a DPS value to the hub, reconnecting if the session has expired."""
         if not self._device:
             logger.error("Not connected")
             return False
 
         try:
             result = self._device.set_value(index, value)
+            # Error 914 = session key expired (common with persistent v3.4 connections)
+            if isinstance(result, dict) and result.get("Err") == "914":
+                logger.warning("Session expired (914) — reconnecting and retrying...")
+                if self.connect():
+                    result = self._device.set_value(index, value)
+                else:
+                    logger.error(f"Reconnection failed, could not set DPS {index}")
+                    return False
             logger.info(f"Set DPS {index} = {value} -> {result}")
             return True
         except Exception as e:
