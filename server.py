@@ -75,6 +75,8 @@ class AppState:
         self.dog_door_prior_mode: str = ""   # mode to restore when Dog Door cancelled
         self.reconnect_hour: int = 15
         self._reconnect_in_progress: bool = False
+        self.hub_connect_time: Optional[datetime] = None
+        self.last_health_check_time: str = ""
 
 
 state = AppState()
@@ -424,6 +426,7 @@ def _poll_loop():
         # --- Health check every 30s ---
         if now - last_health_check >= health_check_interval:
             last_health_check = now
+            state.last_health_check_time = datetime.now().strftime("%H:%M:%S")
             if state.hub and not state.hub.health_check():
                 with state.lock:
                     state.hub_connected = False
@@ -458,6 +461,7 @@ def connect_hub_with_retry(max_minutes: int = 5) -> bool:
         logger.info(f"Hub connect attempt {attempt}...")
         if state.hub and state.hub.connect():
             state.hub_connected = True
+            state.hub_connect_time = datetime.now()
             status = state.hub.status()
             if "error" not in status:
                 with state.lock:
@@ -532,7 +536,7 @@ def start_reconnect_thread():
 
 
 def connect_hub():
-    """Connect to the hub at startup, retrying for up to 5 minutes on failure."""
+    """Start hub connection in background — Flask starts immediately regardless."""
     _load_ntfy_config()
     config = load_config()
     hub = create_hub(config)
@@ -542,12 +546,18 @@ def connect_hub():
 
     state.hub = hub
     state.reconnect_hour = config.get("hub", {}).get("reconnect_hour", 15)
-    logger.info(f"Connecting to hub at {hub.ip_address}...")
-    connect_hub_with_retry(max_minutes=5)
-    if state.hub_connected:
-        logger.info(f"Hub connected at {hub.ip_address}")
-    else:
-        logger.error("Hub connection failed after retries")
+
+    def _connect_bg():
+        logger.info(f"Connecting to hub at {hub.ip_address}...")
+        connect_hub_with_retry(max_minutes=5)
+        if state.hub_connected:
+            logger.info(f"Hub connected at {hub.ip_address}")
+            start_monitor_thread()
+            start_reconnect_thread()
+        else:
+            logger.error("Hub connection failed after retries — app still serving")
+
+    threading.Thread(target=_connect_bg, daemon=True).start()
 
 
 def get_local_ip() -> str:
@@ -816,14 +826,85 @@ def api_test_alert():
 
 
 # ============================================================
+# Service Page
+# ============================================================
+
+@app.route("/service")
+def service_page():
+    return render_template("service.html")
+
+
+@app.route("/api/service/status")
+def api_service_status():
+    import subprocess
+    with state.lock:
+        uptime = None
+        if state.hub_connect_time:
+            delta = datetime.now() - state.hub_connect_time
+            uptime = str(delta).split(".")[0]
+        return jsonify({
+            "hub_connected": state.hub_connected,
+            "hub_ip": state.hub.ip_address if state.hub else None,
+            "hub_uptime": uptime,
+            "last_health_check": state.last_health_check_time,
+            "monitor_running": state._monitor_running,
+            "monitor_mode": state.hub._monitor_mode if state.hub else "",
+            "monitor_rearming": state.hub._monitor_rearming if state.hub else False,
+            "reconnect_in_progress": state._reconnect_in_progress,
+            "ntfy_enabled": _ntfy_enabled,
+        })
+
+
+@app.route("/api/service/reconnect", methods=["POST"])
+def api_service_reconnect():
+    if state._reconnect_in_progress:
+        return jsonify({"ok": False, "error": "Reconnect already in progress"})
+    _trigger_reconnect()
+    return jsonify({"ok": True, "message": "Reconnect started"})
+
+
+@app.route("/api/service/restart", methods=["POST"])
+def api_service_restart():
+    import subprocess
+    try:
+        subprocess.Popen(["sudo", "systemctl", "restart", "agshome"])
+        return jsonify({"ok": True, "message": "Service restart initiated"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/service/test_ntfy", methods=["POST"])
+def api_service_test_ntfy():
+    send_ntfy(
+        "Test notification from AGSHome service panel",
+        title="AGSHome Test",
+        priority=3,
+        tags="white_check_mark",
+    )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/service/logs")
+def api_service_logs():
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["sudo", "journalctl", "-u", "agshome", "-n", "30", "--no-pager", "--output=short"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
+        return jsonify({"ok": True, "lines": lines})
+    except Exception as e:
+        return jsonify({"ok": False, "lines": [], "error": str(e)})
+
+
+# ============================================================
 # Standalone Entry Point
 # ============================================================
 
 if __name__ == "__main__":
-    connect_hub()
+    connect_hub()       # non-blocking — starts background thread
     connect_camera()
-    start_monitor_thread()
-    start_reconnect_thread()
     local_ip = get_local_ip()
     print(f"\n  Phone:   http://agshome.local:5000")
     print(f"  Desktop: http://agshome.local:5000/desktop")

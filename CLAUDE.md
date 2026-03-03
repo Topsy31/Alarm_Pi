@@ -69,6 +69,9 @@ The production service runs on a Raspberry Pi on the local network.
 ```bash
 scp agshome/hub.py pi@agshome:/home/pi/agshome/agshome/hub.py
 scp server.py pi@agshome:/home/pi/agshome/server.py
+scp pi_service.py pi@agshome:/home/pi/agshome/pi_service.py
+scp templates/mobile.html pi@agshome:/home/pi/agshome/templates/mobile.html
+scp templates/service.html pi@agshome:/home/pi/agshome/templates/service.html
 ```
 
 ### Restart service (in SSH session on Pi)

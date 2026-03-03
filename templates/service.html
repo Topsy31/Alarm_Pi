@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <title>AGSHome Service</title>
+    <style>
+        :root {
+            --bg:        #0d0d0f;
+            --surface:   #131316;
+            --raised:    #1c1c21;
+            --border:    #2a2a32;
+            --dim:       #4a4a5a;
+            --text:      #c8c8d8;
+            --bright:    #eeeef8;
+            --c-ok:      #2ecc6e;
+            --c-warn:    #d4860a;
+            --c-err:     #e83a3a;
+            --c-action:  #7c5cbf;
+            --c-ntfy:    #0e8f8f;
+            --c-restart: #e83a3a;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html, body { height: 100%; overflow-x: hidden; }
+
+        body {
+            font-family: 'IBM Plex Mono', monospace;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 0 0 48px;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        /* Grain overlay */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 0;
+            opacity: 0.6;
+        }
+
+        /* ── Header ─────────────────────────────────── */
+        .header {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 420px;
+            padding: 32px 24px 0;
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+        }
+
+        .wordmark {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.6rem;
+            letter-spacing: 0.12em;
+            color: var(--bright);
+            line-height: 1;
+        }
+
+        .wordmark span { color: var(--c-action); }
+
+        .back-link {
+            font-size: 0.65rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--dim);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            transition: color 0.2s;
+        }
+        .back-link:hover { color: var(--text); }
+
+        /* ── Content wrapper ─────────────────────────── */
+        .content {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 420px;
+            padding: 24px 24px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        /* ── Section divider ─────────────────────────── */
+        .divider {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 8px 0 4px;
+        }
+        .divider::before, .divider::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+        .divider-text {
+            font-size: 0.58rem;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--dim);
+            white-space: nowrap;
+        }
+
+        /* ── Info grid ───────────────────────────────── */
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+        }
+
+        .info-item {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 10px 12px;
+        }
+
+        .info-item.full { grid-column: 1 / -1; }
+
+        .info-label {
+            font-size: 0.55rem;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--dim);
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .info-value {
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: var(--text);
+        }
+
+        .info-value.ok    { color: var(--c-ok); }
+        .info-value.warn  { color: var(--c-warn); }
+        .info-value.err   { color: var(--c-err); }
+
+        /* ── Action buttons ──────────────────────────── */
+        .btn-row {
+            display: grid;
+            gap: 8px;
+        }
+        .btn-row.cols-2 { grid-template-columns: 1fr 1fr; }
+        .btn-row.cols-1 { grid-template-columns: 1fr; }
+
+        .btn {
+            background: none;
+            border: none;
+            padding: 0;
+            cursor: pointer;
+            text-align: left;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .btn-inner {
+            background: var(--raised);
+            border: 1px solid var(--border);
+            border-bottom: 3px solid var(--btn-accent, var(--border));
+            border-radius: 4px;
+            padding: 14px 16px 12px;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--text);
+            border-left: 3px solid var(--btn-accent, var(--border));
+            transition: background 0.15s, border-color 0.15s, transform 0.08s, box-shadow 0.15s;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+
+        .btn:active .btn-inner {
+            transform: scale(0.975) translateY(2px);
+            border-bottom-width: 1px;
+        }
+
+        .btn:disabled .btn-inner,
+        .btn.disabled .btn-inner {
+            opacity: 0.35;
+            cursor: default;
+            transform: none;
+        }
+
+        .btn-sub {
+            font-size: 0.58rem;
+            font-weight: 400;
+            letter-spacing: 0.08em;
+            color: var(--dim);
+            text-transform: none;
+        }
+
+        .btn-reconnect { --btn-accent: var(--c-action); }
+        .btn-ntfy      { --btn-accent: var(--c-ntfy); }
+        .btn-restart   { --btn-accent: var(--c-restart); }
+        .btn-logs      { --btn-accent: var(--c-warn); }
+
+        /* ── Log panel ───────────────────────────────── */
+        .log-panel {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 12px;
+            max-height: 320px;
+            overflow-y: auto;
+        }
+
+        .log-line {
+            font-size: 0.6rem;
+            line-height: 1.6;
+            color: var(--dim);
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .log-line.info  { color: var(--text); }
+        .log-line.warn  { color: var(--c-warn); }
+        .log-line.error { color: var(--c-err); }
+
+        .log-empty {
+            font-size: 0.65rem;
+            color: var(--dim);
+            text-align: center;
+            padding: 16px 0;
+        }
+
+        /* ── Toast message ───────────────────────────── */
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%) translateY(80px);
+            background: var(--raised);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 10px 20px;
+            font-size: 0.7rem;
+            letter-spacing: 0.08em;
+            color: var(--text);
+            transition: transform 0.3s ease;
+            z-index: 100;
+            white-space: nowrap;
+        }
+        .toast.show { transform: translateX(-50%) translateY(0); }
+    </style>
+</head>
+<body>
+
+    <header class="header">
+        <div class="wordmark">AGS<span>HOME</span></div>
+        <a href="/" class="back-link">&#8592; Alarm</a>
+    </header>
+
+    <div class="content">
+
+        <!-- Hub -->
+        <div class="divider"><span class="divider-text">Hub</span></div>
+        <div class="info-grid">
+            <div class="info-item">
+                <span class="info-label">Status</span>
+                <span class="info-value" id="hubStatus">—</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">IP Address</span>
+                <span class="info-value" id="hubIp">—</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Uptime</span>
+                <span class="info-value" id="hubUptime">—</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Last Health Check</span>
+                <span class="info-value" id="hubHealth">—</span>
+            </div>
+        </div>
+
+        <!-- Monitor -->
+        <div class="divider"><span class="divider-text">Monitor</span></div>
+        <div class="info-grid">
+            <div class="info-item">
+                <span class="info-label">Thread</span>
+                <span class="info-value" id="monThread">—</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Mode</span>
+                <span class="info-value" id="monMode">—</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Rearming</span>
+                <span class="info-value" id="monRearm">—</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">ntfy</span>
+                <span class="info-value" id="ntfyStatus">—</span>
+            </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="divider"><span class="divider-text">Actions</span></div>
+        <div class="btn-row cols-2">
+            <button class="btn btn-reconnect" id="btnReconnect" onclick="svcCmd('reconnect')">
+                <div class="btn-inner">
+                    Reconnect Hub
+                    <span class="btn-sub">force hub reconnect</span>
+                </div>
+            </button>
+            <button class="btn btn-ntfy" id="btnNtfy" onclick="svcCmd('test_ntfy')">
+                <div class="btn-inner">
+                    Test ntfy
+                    <span class="btn-sub">send test notification</span>
+                </div>
+            </button>
+        </div>
+        <div class="btn-row cols-1">
+            <button class="btn btn-restart" id="btnRestart" onclick="confirmRestart()">
+                <div class="btn-inner">
+                    Restart Service
+                    <span class="btn-sub">restarts agshome systemd service — brief outage</span>
+                </div>
+            </button>
+        </div>
+
+        <!-- Logs -->
+        <div class="divider"><span class="divider-text">Logs</span></div>
+        <div class="btn-row cols-1">
+            <button class="btn btn-logs" id="btnLogs" onclick="refreshLogs()">
+                <div class="btn-inner">
+                    Refresh Logs
+                    <span class="btn-sub">fetch last 30 lines from journalctl</span>
+                </div>
+            </button>
+        </div>
+        <div class="log-panel" id="logPanel">
+            <div class="log-empty">Press Refresh Logs to load</div>
+        </div>
+
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        let busy = false;
+        let restartMode = false;
+        let restartCountdown = 0;
+
+        function showToast(msg, duration = 2500) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), duration);
+        }
+
+        function setAllBusy(on) {
+            ['btnReconnect', 'btnNtfy', 'btnRestart', 'btnLogs'].forEach(id => {
+                const el = document.getElementById(id);
+                if (on) el.classList.add('disabled');
+                else el.classList.remove('disabled');
+            });
+        }
+
+        async function svcCmd(action) {
+            if (busy) return;
+            busy = true;
+            setAllBusy(true);
+            try {
+                const r = await fetch('/api/service/' + action, { method: 'POST' });
+                const d = await r.json();
+                if (d.ok) {
+                    showToast(d.message || 'Done');
+                } else {
+                    showToast('Error: ' + (d.error || 'unknown'));
+                }
+                await poll();
+            } catch (e) {
+                showToast('Request failed');
+            } finally {
+                busy = false;
+                setAllBusy(false);
+            }
+        }
+
+        function confirmRestart() {
+            if (busy) return;
+            if (!confirm('Restart the agshome service? The app will be unavailable for ~15 seconds.')) return;
+            busy = true;
+            setAllBusy(true);
+            fetch('/api/service/restart', { method: 'POST' })
+                .then(() => {
+                    showToast('Service restarting — reconnecting in 20s...', 20000);
+                    restartMode = true;
+                    restartCountdown = 20;
+                    const btn = document.getElementById('btnRestart');
+                    const inner = btn.querySelector('.btn-inner');
+                    const interval = setInterval(() => {
+                        restartCountdown--;
+                        inner.childNodes[0].textContent = `Restarting... (${restartCountdown}s)`;
+                        if (restartCountdown <= 0) {
+                            clearInterval(interval);
+                            restartMode = false;
+                            busy = false;
+                            setAllBusy(false);
+                            inner.childNodes[0].textContent = 'Restart Service';
+                            poll();
+                        }
+                    }, 1000);
+                })
+                .catch(() => {
+                    showToast('Restart command failed');
+                    busy = false;
+                    setAllBusy(false);
+                });
+        }
+
+        async function refreshLogs() {
+            if (busy) return;
+            busy = true;
+            setAllBusy(true);
+            try {
+                const r = await fetch('/api/service/logs');
+                const d = await r.json();
+                const panel = document.getElementById('logPanel');
+                if (d.ok && d.lines.length > 0) {
+                    panel.innerHTML = d.lines.map(line => {
+                        let cls = '';
+                        if (line.includes('[ERROR]') || line.includes('[CRITICAL]')) cls = 'error';
+                        else if (line.includes('[WARNING]')) cls = 'warn';
+                        else if (line.includes('[INFO]')) cls = 'info';
+                        return `<div class="log-line ${cls}">${escHtml(line)}</div>`;
+                    }).join('');
+                    panel.scrollTop = panel.scrollHeight;
+                } else {
+                    panel.innerHTML = `<div class="log-empty">${d.error || 'No log lines returned'}</div>`;
+                }
+            } catch (e) {
+                document.getElementById('logPanel').innerHTML = '<div class="log-empty">Failed to fetch logs</div>';
+            } finally {
+                busy = false;
+                setAllBusy(false);
+            }
+        }
+
+        function escHtml(s) {
+            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        async function poll() {
+            if (restartMode) return;
+            try {
+                const r = await fetch('/api/service/status');
+                const d = await r.json();
+                render(d);
+            } catch {
+                // Service offline — expected during restart
+            }
+        }
+
+        function render(d) {
+            const hubStatus = document.getElementById('hubStatus');
+            hubStatus.textContent = d.hub_connected ? 'Connected' : 'Disconnected';
+            hubStatus.className = 'info-value ' + (d.hub_connected ? 'ok' : 'err');
+
+            document.getElementById('hubIp').textContent = d.hub_ip || '—';
+            document.getElementById('hubUptime').textContent = d.hub_uptime || '—';
+            document.getElementById('hubHealth').textContent = d.last_health_check || '—';
+
+            const monThread = document.getElementById('monThread');
+            monThread.textContent = d.monitor_running ? 'Running' : 'Stopped';
+            monThread.className = 'info-value ' + (d.monitor_running ? 'ok' : 'warn');
+
+            document.getElementById('monMode').textContent = d.monitor_mode || 'none';
+
+            const monRearm = document.getElementById('monRearm');
+            monRearm.textContent = d.monitor_rearming ? 'Yes' : 'No';
+            monRearm.className = 'info-value ' + (d.monitor_rearming ? 'warn' : '');
+
+            const reconnecting = document.getElementById('btnReconnect');
+            if (d.reconnect_in_progress) {
+                reconnecting.querySelector('.btn-sub').textContent = 'reconnect in progress...';
+            } else {
+                reconnecting.querySelector('.btn-sub').textContent = 'force hub reconnect';
+            }
+
+            const ntfy = document.getElementById('ntfyStatus');
+            ntfy.textContent = d.ntfy_enabled ? 'Enabled' : 'Disabled';
+            ntfy.className = 'info-value ' + (d.ntfy_enabled ? 'ok' : 'warn');
+        }
+
+        setInterval(poll, 3000);
+        poll();
+    </script>
+</body>
+</html>

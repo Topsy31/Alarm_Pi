@@ -107,6 +107,17 @@
             transition: color 0.6s ease;
         }
 
+        .service-link {
+            font-size: 0.6rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--dim);
+            text-decoration: none;
+            padding: 4px 0;
+            transition: color 0.2s;
+        }
+        .service-link:hover { color: var(--text); }
+
         .conn-dot {
             display: flex;
             align-items: center;
@@ -439,7 +450,10 @@
     <!-- Header -->
     <header class="header">
         <div class="wordmark">AGS<span>HOME</span></div>
-        <div class="conn-dot" id="conn">connecting...</div>
+        <div style="display:flex;align-items:center;gap:16px;">
+            <a href="/service" class="service-link">Service</a>
+            <div class="conn-dot" id="conn">connecting...</div>
+        </div>
     </header>
 
     <!-- Status Display -->

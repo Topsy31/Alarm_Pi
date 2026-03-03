@@ -162,15 +162,8 @@ def setup(icon):
 
     def _startup():
         _register_mdns()
-        connect_hub()
+        connect_hub()       # non-blocking — monitor/reconnect threads start on success
         connect_camera()
-        if state.hub_connected:
-            icon.icon = create_icon(connected=True)
-            icon.title = f"AGSHome — connected ({state.hub.ip_address})"
-        else:
-            icon.title = "AGSHome — connection failed"
-        start_monitor_thread()
-        start_reconnect_thread()
         logger.info(f"Server ready at http://{MDNS_NAME}.local:{PORT}")
 
     threading.Thread(target=_startup, daemon=True).start()
