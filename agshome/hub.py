@@ -4,15 +4,15 @@ hub.py — AGSHome alarm hub wrapper using TinyTuya.
 Provides a high-level interface to the AGSHome security hub over the
 local network (Tuya encrypted protocol). No cloud dependency at runtime.
 
-Mode functions:
-    disarm()        — disarm the hub
-    arm_away()      — full alarm, hub owns siren, no auto-rearm
-    arm_loud()      — HOME mode, HIGH volume, beep on arm (Night)
-    arm_silent()    — HOME mode, MUTE volume, no beep (Day/Silent Night/Dog Door)
+Architecture (Pi-owned state machine):
+    The hub is kept in HOME + MUTE permanently after initial setup.
+    The Pi controls all alarm logic — the hub acts as a dumb peripheral
+    that fires sensor events (DPS 116) and receives siren commands (DPS 104).
 
-Rearm sequences (called by monitor loop on trigger):
-    rearm_night()   — wait 30s, cut siren, silent disarm/rearm, restore HIGH
-    rearm_silent()  — immediate silent disarm/rearm, volume stays MUTE
+    ensure_home_muted()  — call at startup and after reconnect (one write max)
+    siren_on()           — fire siren directly via DPS 104
+    siren_off()          — silence siren via DPS 104
+    set_night_light()    — toggle night light (also DPS 104)
 """
 
 import logging
@@ -31,8 +31,6 @@ from .dps_map import (
 
 logger = logging.getLogger(__name__)
 
-NIGHT_SIREN_DURATION = 30  # seconds siren runs before auto-rearm in Night mode
-
 
 class AGSHomeHub:
     """
@@ -41,9 +39,9 @@ class AGSHomeHub:
     Usage:
         hub = AGSHomeHub(device_id="...", ip_address="...", local_key="...")
         if hub.connect():
-            hub.arm_loud()      # Night mode
-            hub.arm_silent()    # Silent Night / Day / Dog Door
-            hub.disarm()
+            hub.ensure_home_muted()   # one-time setup at startup
+            hub.siren_on()            # fire siren directly
+            hub.siren_off()           # silence siren
         hub.disconnect()
     """
 
@@ -65,9 +63,7 @@ class AGSHomeHub:
 
         # Monitor state
         self._monitor_active = False
-        self._monitor_mode = ""           # "night", "day", "silent_night", "dog_door"
-        self._monitor_rearming = False
-        self._abort_rearm = False         # set True by external disarm to cancel rearm wait
+        self._monitor_mode = ""           # "night", "silent_night", "dog_door", "away"
         self._monitor_listeners: list[Callable] = []
 
     # ------------------------------------------------------------------ #
@@ -244,118 +240,50 @@ class AGSHomeHub:
         """Set an arbitrary DPS value (for testing/discovery)."""
         return self._set_dps(index, value)
 
+    # ------------------------------------------------------------------ #
+    # Pi-owned siren control (DPS 104)
+    # ------------------------------------------------------------------ #
+
+    def ensure_home_muted(self) -> bool:
+        """
+        Set hub to HOME + MUTE if not already in that state.
+
+        Called at startup and after any reconnect. This is the only place
+        DPS 101 (mode) is written — one-time setup, never during normal operation.
+        Returns True if already correct or successfully set.
+        """
+        status = self.status()
+        if "error" in status:
+            logger.warning(f"ensure_home_muted: status error — {status['error']}")
+            return False
+        mode = status.get(DPS_ALARM_MODE)
+        volume = status.get(DPS_VOLUME)
+        changed = False
+        if mode != AlarmMode.HOME.value:
+            self._set_dps(DPS_ALARM_MODE, AlarmMode.HOME.value)
+            changed = True
+        if volume != VolumeLevel.MUTE.value:
+            self._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
+            changed = True
+        if changed:
+            logger.info("Hub: set to HOME+MUTE (one-time setup)")
+        else:
+            logger.info("Hub: already HOME+MUTE — no write needed")
+        return True
+
+    def siren_on(self) -> None:
+        """Fire the siren directly via DPS 104."""
+        self._set_dps(DPS_SIREN, True)
+        logger.info("Siren: ON")
+
+    def siren_off(self) -> None:
+        """Silence the siren directly via DPS 104."""
+        self._set_dps(DPS_SIREN, False)
+        logger.info("Siren: OFF")
+
     def set_night_light(self, on: bool) -> bool:
         """Turn the night light on or off (DPS 104)."""
         return self._set_dps(DPS_SIREN, on)
-
-    # ------------------------------------------------------------------ #
-    # Named mode functions
-    # ------------------------------------------------------------------ #
-
-    def disarm(self) -> bool:
-        """Disarm the hub (DPS 101 = DISARMED)."""
-        ok = self._set_dps(DPS_ALARM_MODE, AlarmMode.DISARMED.value)
-        if ok:
-            logger.info("Hub: disarmed")
-        return ok
-
-    def arm_away(self) -> bool:
-        """
-        AWAY mode: full alarm, hub owns siren, no auto-rearm.
-
-        Sets volume HIGH then arms to AWAY. The hub handles the siren
-        independently — our code does not interfere.
-        """
-        self._set_dps(DPS_VOLUME, VolumeLevel.HIGH.value)
-        time.sleep(0.5)
-        ok = self._set_dps(DPS_ALARM_MODE, AlarmMode.AWAY.value)
-        if ok:
-            logger.info("Hub: armed AWAY (loud)")
-        return ok
-
-    def arm_loud(self) -> bool:
-        """
-        HOME mode, HIGH volume — used by Night mode.
-
-        Hub beeps on arm. Siren sounds on trigger until rearm cuts it.
-        """
-        self._set_dps(DPS_VOLUME, VolumeLevel.HIGH.value)
-        time.sleep(0.5)
-        ok = self._set_dps(DPS_ALARM_MODE, AlarmMode.HOME.value)
-        if ok:
-            logger.info("Hub: armed HOME loud (night)")
-        return ok
-
-    def arm_silent(self) -> bool:
-        """
-        HOME mode, MUTE volume — used by Day, Silent Night, Dog Door, and all rearms.
-
-        No arm beep. No siren on trigger (volume muted throughout).
-        Note: hub suppresses DPS 116 (sensor name) when muted — sensor name
-        will not be available in ntfy or the app card.
-
-        Note: the hub produces a short arm beep regardless of volume setting.
-        This is driven by a hardware piezo in the DP-W2.1 firmware and cannot
-        be suppressed via any DPS command. DPS 107 (volume) controls the siren
-        and sensor alerts only — not the arm confirmation beep.
-        """
-        self._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
-        ok = self._set_dps(DPS_ALARM_MODE, AlarmMode.HOME.value)
-        if ok:
-            logger.info("Hub: armed HOME silent (day/silent_night/dog_door)")
-        return ok
-
-    # ------------------------------------------------------------------ #
-    # Rearm sequences
-    # ------------------------------------------------------------------ #
-
-    def rearm_night(self) -> bool:
-        """
-        Night rearm: wait NIGHT_SIREN_DURATION seconds (siren runs), then
-        cut siren, silent disarm/rearm, restore HIGH volume.
-
-        Watches _abort_rearm every second — if set (remote or app disarmed),
-        exits immediately without rearming.
-
-        Returns True if rearmed, False if aborted.
-        """
-        logger.info(f"Night rearm: siren running, waiting {NIGHT_SIREN_DURATION}s...")
-        for _ in range(NIGHT_SIREN_DURATION):
-            if self._abort_rearm:
-                logger.info("Night rearm: aborted (external disarm detected)")
-                self._abort_rearm = False
-                return False
-            time.sleep(1)
-
-        logger.info("Night rearm: cutting siren, silent disarm/rearm...")
-        self._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
-        self._set_dps(DPS_ALARM_MODE, AlarmMode.DISARMED.value)
-        time.sleep(1.0)
-        self._set_dps(DPS_ALARM_MODE, AlarmMode.HOME.value)
-        time.sleep(0.5)
-        self._set_dps(DPS_VOLUME, VolumeLevel.HIGH.value)
-        logger.info("Night rearm: complete")
-        return True
-
-    def rearm_silent(self) -> bool:
-        """
-        Silent rearm: immediate disarm/rearm, volume stays MUTE throughout.
-
-        Used by Day, Silent Night, Dog Door.
-        Returns True always (no abort logic needed — no siren to wait out).
-        """
-        logger.info("Silent rearm: disarm/rearm...")
-        self._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
-        self._set_dps(DPS_ALARM_MODE, AlarmMode.DISARMED.value)
-        time.sleep(1.0)
-        self._set_dps(DPS_ALARM_MODE, AlarmMode.HOME.value)
-        logger.info("Silent rearm: complete")
-        return True
-
-    def abort_rearm(self):
-        """Signal the rearm sequence to abort (called when external disarm detected)."""
-        self._abort_rearm = True
-        logger.info("Hub: rearm abort signalled")
 
     # ------------------------------------------------------------------ #
     # Monitor mode
@@ -369,7 +297,6 @@ class AGSHomeHub:
         """
         Register a callback for monitor events.
         Callback signature: callback(event_type, message)
-        event_type: "sensor", "rearm", "silence", "info", "aborted"
         """
         self._monitor_listeners.append(callback)
 
@@ -385,10 +312,11 @@ class AGSHomeHub:
         """
         Enter monitor mode for the given mode string.
 
-        mode must be one of: "night", "day", "silent_night", "dog_door"
+        mode must be one of: "night", "silent_night", "dog_door", "away"
 
-        The hub must already be armed (arm_loud or arm_silent called before this).
-        This method only sets the monitor state — it does not arm the hub.
+        The hub is already in HOME+MUTE (set at startup). This method only
+        records the current Pi mode so listeners can see it — it does not
+        arm/disarm the hub.
         """
         if self._monitor_active:
             logger.warning("Monitor already active — stopping first")
@@ -396,42 +324,15 @@ class AGSHomeHub:
 
         self._monitor_active = True
         self._monitor_mode = mode
-        self._monitor_rearming = False
-        self._abort_rearm = False
         logger.info(f"Monitor started (mode: {mode})")
         self._notify_monitor("info", f"Monitor started ({mode})")
 
     def stop_monitor(self):
-        """Exit monitor mode. Does not disarm the hub — caller is responsible."""
+        """Exit monitor mode."""
         self._monitor_active = False
-        self._monitor_rearming = False
-        self._abort_rearm = False
         self._monitor_mode = ""
         logger.info("Monitor stopped")
         self._notify_monitor("info", "Monitor stopped")
-
-    def run_rearm_sequence(self, mode: str):
-        """
-        Background thread entry point: run the appropriate rearm sequence for mode.
-
-        Called by the server monitor loop when a trigger is detected.
-        """
-        self._monitor_rearming = True
-        try:
-            if mode == "night":
-                rearmed = self.rearm_night()
-                if rearmed:
-                    self._notify_monitor("rearm", "Re-armed (night)")
-                else:
-                    self._notify_monitor("aborted", "Rearm aborted — external disarm")
-            else:
-                # day, silent_night, dog_door — all use silent rearm
-                self.rearm_silent()
-                self._notify_monitor("rearm", f"Re-armed ({mode})")
-        except Exception as e:
-            logger.error(f"Rearm sequence error: {e}")
-        finally:
-            self._monitor_rearming = False
 
     def monitor_check_async(self) -> list[dict]:
         """
@@ -440,9 +341,9 @@ class AGSHomeHub:
         Returns a list of event dicts: [{"type": str, "message": str, "dps": dict}]
 
         Event types:
-            "sensor"       — DPS 116: sensor name (only in loud modes)
+            "sensor"       — DPS 116: sensor name
             "triggered"    — DPS 103: alarm triggered bool
-            "mode"         — DPS 101: hub mode changed (includes remote control actions)
+            "mode"         — DPS 101: hub mode changed (remote control actions)
             "siren"        — DPS 104: siren/night light state
             "notification" — DPS 121: hub notification string
         """

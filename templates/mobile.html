@@ -384,7 +384,6 @@
         .btn-disarm { --btn-accent: var(--c-disarm); }
         .btn-away   { --btn-accent: var(--c-away); }
         .btn-night  { --btn-accent: var(--c-night); }
-        .btn-day    { --btn-accent: var(--c-day); }
         .btn-silent { --btn-accent: var(--c-silent); }
         .btn-dog    { --btn-accent: var(--c-dog); }
         .btn-nl     { --btn-accent: var(--c-day); }
@@ -501,29 +500,23 @@
             <button class="btn btn-away" id="bAway" onclick="cmd('away')">
                 <div class="btn-inner">
                     AWAY
-                    <span class="btn-sub">full siren</span>
+                    <span class="btn-sub">siren until disarmed</span>
                 </div>
             </button>
             <button class="btn btn-night" id="bNight" onclick="cmd('night')">
                 <div class="btn-inner">
                     NIGHT
-                    <span class="btn-sub">30s then rearm</span>
+                    <span class="btn-sub">siren 30s · retriggerable</span>
                 </div>
             </button>
         </div>
 
-        <!-- Day + Silent Night -->
-        <div class="btn-row cols-2">
-            <button class="btn btn-day" id="bDay" onclick="cmd('day')">
-                <div class="btn-inner">
-                    DAY
-                    <span class="btn-sub">ntfy only</span>
-                </div>
-            </button>
+        <!-- Silent Night -->
+        <div class="btn-row cols-1">
             <button class="btn btn-silent" id="bSilent" onclick="cmd('silent_night')">
                 <div class="btn-inner">
-                    SILENT
-                    <span class="btn-sub">no siren</span>
+                    SILENT NIGHT
+                    <span class="btn-sub">ntfy only · silent</span>
                 </div>
             </button>
         </div>
@@ -562,9 +555,8 @@
         const LABELS = {
             disarmed:     'DISARMED',
             away:         'AWAY',
-            day:          'DAY',
             night:        'NIGHT',
-            silent_night: 'SILENT',
+            silent_night: 'SILENT NIGHT',
             dog_door:     'DOG DOOR',
         };
 
@@ -572,7 +564,6 @@
             disarmed:     'var(--c-disarm)',
             away:         'var(--c-away)',
             night:        'var(--c-night)',
-            day:          'var(--c-day)',
             silent_night: 'var(--c-silent)',
             dog_door:     'var(--c-dog)',
         };
@@ -581,7 +572,6 @@
             disarmed:     '46, 204, 110',
             away:         '232, 58, 58',
             night:        '124, 92, 191',
-            day:          '212, 134, 10',
             silent_night: '14, 143, 143',
             dog_door:     '42, 122, 69',
         };
@@ -660,7 +650,6 @@
             // Button active states
             document.getElementById('bDisarm').classList.toggle('active', d.mode === 'disarmed');
             document.getElementById('bAway').classList.toggle('active', d.mode === 'away');
-            document.getElementById('bDay').classList.toggle('active', d.mode === 'day');
             document.getElementById('bNight').classList.toggle('active', d.mode === 'night');
             document.getElementById('bSilent').classList.toggle('active', d.mode === 'silent_night');
 
@@ -689,7 +678,7 @@
             // Phone alert on new trigger in silent modes
             if (d.alert_seq !== undefined && lastAlertSeq >= 0
                 && d.alert_seq > lastAlertSeq
-                && (d.mode === 'silent_night' || d.mode === 'dog_door' || d.mode === 'day')) {
+                && (d.mode === 'silent_night' || d.mode === 'dog_door')) {
                 triggerPhoneAlert(d.last_sensor_name);
             }
             if (d.alert_seq !== undefined) lastAlertSeq = d.alert_seq;

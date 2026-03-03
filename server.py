@@ -4,15 +4,22 @@ server.py -- Flask REST API for mobile alarm control.
 Serves a mobile-optimised HTML page and provides API endpoints
 for controlling the AGSHome alarm hub from a phone browser.
 
+Architecture (Pi-owned state machine):
+    The hub stays in HOME + MUTE permanently after startup.
+    The Pi owns all mode logic and fires/silences the siren directly
+    via DPS 104. No DPS 101 (mode) writes occur during normal operation,
+    eliminating the 914 session-rejection errors caused by frequent rearms.
+
 Usage:
     python server.py                 # Run standalone (for testing)
-    python tray.py                   # Production: launches via system tray
+    python pi_service.py             # Production: run via systemd on Pi
 """
 
 import json
 import logging
 import os
 import socket
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
@@ -51,6 +58,8 @@ DEVICES_FILE = "devices.json"
 
 app = Flask(__name__)
 
+SIREN_DURATION = 30  # seconds the siren runs in Night mode before auto-silence
+
 
 # ============================================================
 # Application State
@@ -61,7 +70,7 @@ class AppState:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.mode = "disarmed"            # disarmed/away/night/day/silent_night/dog_door
+        self.mode = "disarmed"            # disarmed/away/night/silent_night/dog_door
         self.night_light = False
         self.hub_connected = False
         self.last_sensor_name = ""
@@ -72,11 +81,13 @@ class AppState:
         self.camera_connected = False
         self._monitor_running = False
         self._monitor_thread: Optional[threading.Thread] = None
-        self.dog_door_prior_mode: str = ""   # mode to restore when Dog Door cancelled
         self.reconnect_hour: int = 15
         self._reconnect_in_progress: bool = False
         self.hub_connect_time: Optional[datetime] = None
         self.last_health_check_time: str = ""
+        # Pi-owned siren state
+        self._siren_running: bool = False
+        self._abort_siren: bool = False
 
 
 state = AppState()
@@ -140,7 +151,7 @@ def send_ntfy(message: str, title: str = "AGSHome",
 
 
 # ============================================================
-# Hub Setup (reuses pattern from dashboard.py)
+# Hub Setup
 # ============================================================
 
 def load_config() -> dict:
@@ -218,6 +229,60 @@ def connect_camera():
 
 
 # ============================================================
+# Pi-owned Siren Control
+# ============================================================
+
+def _stop_siren_if_running():
+    """Signal the siren thread to stop (called by disarm)."""
+    if state._siren_running:
+        state._abort_siren = True
+
+
+def _run_night_siren():
+    """
+    Fire siren for SIREN_DURATION seconds then silence.
+    Retriggerable after completion — siren_running is cleared on exit.
+    """
+    state._siren_running = True
+    state._abort_siren = False
+    try:
+        if state.hub:
+            state.hub.siren_on()
+        for _ in range(SIREN_DURATION):
+            if state._abort_siren:
+                logger.info("Night siren: aborted by disarm")
+                break
+            time.sleep(1)
+        if state.hub:
+            state.hub.siren_off()
+    except Exception as e:
+        logger.error(f"Night siren error: {e}")
+    finally:
+        state._siren_running = False
+        state._abort_siren = False
+
+
+def _run_away_siren():
+    """
+    Fire siren indefinitely until _abort_siren is set (by disarm).
+    """
+    state._siren_running = True
+    state._abort_siren = False
+    try:
+        if state.hub:
+            state.hub.siren_on()
+        while not state._abort_siren:
+            time.sleep(1)
+        if state.hub:
+            state.hub.siren_off()
+    except Exception as e:
+        logger.error(f"Away siren error: {e}")
+    finally:
+        state._siren_running = False
+        state._abort_siren = False
+
+
+# ============================================================
 # Background Monitor
 # ============================================================
 
@@ -225,13 +290,15 @@ def _handle_trigger(current_mode: str, sensor_name: str = ""):
     """
     Called when a sensor trigger is detected (push or poll).
 
-    Sends ntfy, updates app state, and starts the rearm sequence.
-    Guards against duplicate firing if rearm is already running.
+    Sends ntfy, updates app state, fires siren if appropriate.
+    Guards against duplicate firing while siren is already running.
     """
     if not state.hub:
         return
-    if state.hub._monitor_rearming:
-        logger.debug("Trigger detected but rearm already in progress — ignoring duplicate")
+
+    # Guard: siren already running — do not stack another thread
+    if state._siren_running:
+        logger.debug("Trigger detected but siren already running — ignoring duplicate")
         return
 
     now_str = datetime.now().strftime("%H:%M:%S")
@@ -240,67 +307,56 @@ def _handle_trigger(current_mode: str, sensor_name: str = ""):
     with state.lock:
         state.alert_seq += 1
         state.last_sensor_time = now_str
-        state.last_sensor_name = sensor_name if sensor_name else "Sensor triggered"
+        state.last_sensor_name = display_name
 
     ntfy_body = f"{display_name} ({current_mode})"
     send_ntfy(ntfy_body, title="Alarm Triggered",
               priority=_ntfy_priority_alert, tags="rotating_light,warning")
 
-    # Silent modes: no rearm — hub stays in HOME/MUTE, no siren to cut,
-    # DPS 103 resets on its own. Any DPS 101 write causes a piezo beep.
-    if current_mode in ("dog_door", "silent_night"):
-        logger.info(f"{current_mode} trigger: ntfy sent, no rearm")
+    # Modes that only send ntfy — no siren
+    if current_mode in ("disarmed", "silent_night", "dog_door"):
+        logger.info(f"{current_mode} trigger: ntfy sent, no siren")
         return
 
-    if state.hub.monitor_active:
-        threading.Thread(
-            target=state.hub.run_rearm_sequence,
-            args=(current_mode,),
-            daemon=True,
-        ).start()
+    if current_mode == "night":
+        threading.Thread(target=_run_night_siren, daemon=True).start()
+    elif current_mode == "away":
+        threading.Thread(target=_run_away_siren, daemon=True).start()
 
 
 def _reflect_remote_action(hub_mode_val: str):
     """
     Called when DPS 101 changes unexpectedly (remote control or external arm/disarm).
 
-    Maps hub mode values to app state and handles rearm abort on external disarm.
-    Ignores changes we initiated ourselves (when _monitor_rearming is True).
+    In the Pi-owned model the hub is always expected to be in HOME.
+    The only meaningful external action we act on is a remote DISARM.
+    If hub reports non-HOME, restore HOME+MUTE.
     """
     if not state.hub:
         return
 
-    # Mode changes we triggered ourselves during rearm — ignore
-    if state.hub._monitor_rearming:
-        return
-
     if hub_mode_val == AlarmMode.DISARMED.value:
-        # Remote or app disarmed — abort any pending rearm wait
-        if state.hub._monitor_active:
-            state.hub.abort_rearm()
+        with state.lock:
+            current = state.mode
+        if current == "disarmed":
+            return
+        # Remote or physical keypad disarmed — stop siren, update Pi state
+        _stop_siren_if_running()
+        if state.hub.monitor_active:
             state.hub.stop_monitor()
         with state.lock:
             state.mode = "disarmed"
-            state.dog_door_prior_mode = ""
         send_ntfy("Disarmed via remote", tags="unlock")
         logger.info("Remote: disarmed")
 
     elif hub_mode_val == AlarmMode.AWAY.value:
-        # Remote armed to AWAY
-        with state.lock:
-            state.mode = "away"
-        send_ntfy("Away armed via remote", tags="lock")
-        logger.info("Remote: armed AWAY")
+        # Hub should never be in AWAY in Pi-owned model — restore HOME+MUTE
+        logger.warning("Remote: hub in AWAY — restoring HOME+MUTE")
+        state.hub.ensure_home_muted()
 
     elif hub_mode_val == AlarmMode.HOME.value:
-        # Remote armed to HOME — treat as Night
-        if state.hub.monitor_active:
-            state.hub.stop_monitor()
-        state.hub.start_monitor(mode="night")
-        with state.lock:
-            state.mode = "night"
-        send_ntfy("Night armed via remote", tags="moon")
-        logger.info("Remote: armed HOME → night")
+        # Expected state — nothing to do
+        pass
 
 
 def _monitor_loop():
@@ -309,7 +365,7 @@ def _monitor_loop():
 
     Uses receive() only — no status() calls here. status() sends a new
     request on the same socket that receive() is listening on, which
-    corrupts the session. Polling for muted-mode triggers is handled by
+    corrupts the session. Polling for trigger detection is handled by
     the separate _poll_loop() thread which uses its own connection.
     """
     while state._monitor_running:
@@ -349,20 +405,25 @@ def _monitor_loop():
 
 def _poll_loop():
     """
-    Background thread: polls hub status() every 3s to catch triggers that
-    the hub suppresses in muted modes (DPS 116/103 not pushed when muted).
+    Background thread: polls hub status() to catch triggers and detect
+    remote mode changes.
+
+    Poll frequency is adaptive:
+    - silent_night / dog_door: every 10s (async push unreliable in muted modes)
+    - all other modes: every 30s (async push reliable; poll only for health)
 
     Uses a SEPARATE TinyTuya device instance so it doesn't interfere with
     the receive() session in _monitor_loop().
-    Also performs the 30s health check.
+    Health check runs every 60s to lower hub load.
+
+    After each poll, if hub DPS 101 ≠ HOME, ensure_home_muted() is called
+    to restore the expected state (e.g. after hub power cycle).
     """
     import tinytuya as _tinytuya
-    poll_interval = 3.0
-    health_check_interval = 30.0
+    health_check_interval = 60.0
     last_poll = 0.0
     last_health_check = 0.0
     last_poll_triggered = False
-    last_polled_hub_mode = None
     poll_device = None
 
     while state._monitor_running:
@@ -373,6 +434,11 @@ def _poll_loop():
             continue
 
         now = time.time()
+
+        # Adaptive poll interval
+        with state.lock:
+            current_mode = state.mode
+        poll_interval = 10.0 if current_mode in ("silent_night", "dog_door") else 30.0
 
         # --- Lazy-create a dedicated poll device ---
         if poll_device is None:
@@ -390,7 +456,7 @@ def _poll_loop():
                 poll_device = None
                 continue
 
-        # --- Poll every 3s for DPS 103 ---
+        # --- Poll at adaptive interval ---
         if now - last_poll >= poll_interval:
             last_poll = now
             try:
@@ -398,14 +464,15 @@ def _poll_loop():
                 if isinstance(result, dict) and "dps" in result:
                     dps = result["dps"]
 
-                    # Check for remote mode changes (DPS 101)
+                    # Restore HOME+MUTE if hub drifted (e.g. power cycle)
                     polled_mode = dps.get(DPS_ALARM_MODE)
-                    if polled_mode is not None and polled_mode != last_polled_hub_mode:
-                        last_polled_hub_mode = polled_mode
+                    if polled_mode is not None and polled_mode != AlarmMode.HOME.value:
+                        logger.warning(f"Poll: hub DPS 101 = {polled_mode!r} (expected HOME) — restoring")
                         _reflect_remote_action(polled_mode)
-                    elif polled_mode is not None:
-                        last_polled_hub_mode = polled_mode
+                        if polled_mode != AlarmMode.DISARMED.value:
+                            state.hub.ensure_home_muted()
 
+                    # Trigger detection via DPS 103
                     triggered = bool(dps.get(DPS_ALARM_TRIGGERED, False))
                     if triggered and not last_poll_triggered:
                         with state.lock:
@@ -416,6 +483,7 @@ def _poll_loop():
                         if state.hub and state.hub.monitor_active:
                             _handle_trigger(current_mode, sensor_name)
                     last_poll_triggered = triggered
+
                 elif isinstance(result, dict) and result.get("Err") == "914":
                     logger.warning("Poll: hub returned 914")
                     poll_device = None
@@ -423,7 +491,7 @@ def _poll_loop():
                 logger.warning(f"Poll error: {e}")
                 poll_device = None
 
-        # --- Health check every 30s ---
+        # --- Health check every 60s ---
         if now - last_health_check >= health_check_interval:
             last_health_check = now
             state.last_health_check_time = datetime.now().strftime("%H:%M:%S")
@@ -453,7 +521,7 @@ def stop_monitor_thread():
 # ============================================================
 
 def connect_hub_with_retry(max_minutes: int = 5) -> bool:
-    """Try to connect hub, retrying every 30s for up to max_minutes. Sends ntfy if exhausted."""
+    """Try to connect hub, retrying every 30s for up to max_minutes."""
     deadline = time.time() + (max_minutes * 60)
     attempt = 0
     while time.time() < deadline:
@@ -462,6 +530,8 @@ def connect_hub_with_retry(max_minutes: int = 5) -> bool:
         if state.hub and state.hub.connect():
             state.hub_connected = True
             state.hub_connect_time = datetime.now()
+            # Set hub to HOME+MUTE — the one-time setup write
+            state.hub.ensure_home_muted()
             status = state.hub.status()
             if "error" not in status:
                 with state.lock:
@@ -573,25 +643,6 @@ def get_local_ip() -> str:
 
 
 # ============================================================
-# Mode Helpers
-# ============================================================
-
-def _stop_current_mode():
-    """
-    Stop any active monitor mode and disarm the hub. Clears Dog Door state.
-
-    Every mode activation calls this first to ensure a clean transition
-    regardless of what mode was previously active.
-    """
-    with state.lock:
-        state.dog_door_prior_mode = ""
-    if state.hub:
-        if state.hub.monitor_active:
-            state.hub.stop_monitor()
-        state.hub.disarm()
-
-
-# ============================================================
 # API Routes
 # ============================================================
 
@@ -634,7 +685,9 @@ def api_status():
 def api_disarm():
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
-    _stop_current_mode()
+    _stop_siren_if_running()
+    if state.hub and state.hub.monitor_active:
+        state.hub.stop_monitor()
     with state.lock:
         state.mode = "disarmed"
     send_ntfy("Alarm disarmed", tags="unlock")
@@ -645,37 +698,22 @@ def api_disarm():
 def api_away():
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
-    _stop_current_mode()
-    # Away: HIGH volume, AWAY mode. Hub owns siren — no monitor, no auto-rearm.
-    state.hub.arm_away()
+    _stop_siren_if_running()
+    if state.hub:
+        state.hub.start_monitor(mode="away")
     with state.lock:
         state.mode = "away"
     send_ntfy("Alarm set to AWAY", tags="lock")
     return jsonify({"ok": True, "mode": "away"})
 
 
-@app.route("/api/day", methods=["POST"])
-def api_day():
-    if not state.hub_connected:
-        return jsonify({"error": "Hub not connected"}), 503
-    _stop_current_mode()
-    # Day: MUTE volume, HOME mode. No arm beep, no siren. ntfy only.
-    state.hub.arm_silent()
-    state.hub.start_monitor(mode="day")
-    with state.lock:
-        state.mode = "day"
-    send_ntfy("Day monitor active", tags="eyes")
-    return jsonify({"ok": True, "mode": "day"})
-
-
 @app.route("/api/night", methods=["POST"])
 def api_night():
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
-    _stop_current_mode()
-    # Night: HIGH volume, HOME mode. Arm beep. Siren runs 30s then auto-rearm silently.
-    state.hub.arm_loud()
-    state.hub.start_monitor(mode="night")
+    _stop_siren_if_running()
+    if state.hub:
+        state.hub.start_monitor(mode="night")
     with state.lock:
         state.mode = "night"
     send_ntfy("Night monitor active", tags="moon")
@@ -686,10 +724,9 @@ def api_night():
 def api_silent_night():
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
-    _stop_current_mode()
-    # Silent Night: MUTE volume, HOME mode. No arm beep, no siren. ntfy only.
-    state.hub.arm_silent()
-    state.hub.start_monitor(mode="silent_night")
+    _stop_siren_if_running()
+    if state.hub:
+        state.hub.start_monitor(mode="silent_night")
     with state.lock:
         state.mode = "silent_night"
     send_ntfy("Silent night active", tags="zzz")
@@ -699,12 +736,10 @@ def api_silent_night():
 @app.route("/api/suspend", methods=["POST"])
 def api_suspend():
     """
-    Dog Door: mute volume only — no mode change, no beep, no siren.
+    Dog Door: mute-style monitoring with ntfy only (no siren).
 
-    Hub stays in HOME mode with monitor running. Only the volume is changed
-    to MUTE so sensor triggers are silent. Monitor mode switches to dog_door
-    so the rearm sequence knows to stay silent after a trigger.
-    Only available in night mode.
+    Only available in Night mode. Switches Pi state to dog_door
+    so triggers are handled silently. Hub stays in HOME+MUTE unchanged.
     """
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
@@ -712,16 +747,12 @@ def api_suspend():
         current_mode = state.mode
         if current_mode != "night":
             return jsonify({"error": "Dog Door only available in Night mode"}), 400
-        if state.dog_door_prior_mode:
-            return jsonify({"ok": True, "mode": "dog_door"})
-        state.dog_door_prior_mode = current_mode
         state.mode = "dog_door"
 
-    # Mute only — hub stays in HOME, monitor keeps running, no DPS 101 write
-    state.hub._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
-    state.hub._monitor_mode = "dog_door"
+    if state.hub:
+        state.hub._monitor_mode = "dog_door"
 
-    logger.info("Dog door: volume muted, monitor mode → dog_door")
+    logger.info("Dog door: active (ntfy-only mode)")
     send_ntfy("Dog door — alarm muted", tags="dog")
     return jsonify({"ok": True, "mode": "dog_door"})
 
@@ -729,25 +760,21 @@ def api_suspend():
 @app.route("/api/suspend/cancel", methods=["POST"])
 def api_suspend_cancel():
     """
-    Cancel Dog Door: restore volume only — no mode change, no beep.
+    Cancel Dog Door: restore Night mode.
 
-    Hub stays in HOME, monitor keeps running, volume restored to HIGH.
-    Monitor mode switches back to night.
+    Hub stays in HOME+MUTE unchanged — just update Pi state.
     """
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
     with state.lock:
-        prior_mode = state.dog_door_prior_mode
-        if not prior_mode:
+        if state.mode != "dog_door":
             return jsonify({"ok": True, "mode": state.mode})
-        state.dog_door_prior_mode = ""
         state.mode = "night"
 
-    # Restore volume only — hub stays in HOME, no DPS 101 write
-    state.hub._set_dps(DPS_VOLUME, VolumeLevel.HIGH.value)
-    state.hub._monitor_mode = "night"
+    if state.hub:
+        state.hub._monitor_mode = "night"
 
-    logger.info("Dog door cancelled — volume restored, monitor mode → night")
+    logger.info("Dog door cancelled — Night restored")
     send_ntfy("Dog door cancelled — Night restored", tags="lock")
     return jsonify({"ok": True, "mode": "night"})
 
@@ -759,7 +786,8 @@ def api_nightlight():
     with state.lock:
         state.night_light = not state.night_light
         new_state = state.night_light
-    state.hub.set_night_light(new_state)
+    if state.hub:
+        state.hub.set_night_light(new_state)
     return jsonify({"ok": True, "night_light": new_state})
 
 
@@ -808,8 +836,7 @@ def api_camera_snapshot():
 
 @app.route("/api/test_alert", methods=["POST"])
 def api_test_alert():
-    """Simulate a sensor trigger for testing phone alerts.
-    Also sets mode to silent_night so the phone alert fires."""
+    """Simulate a sensor trigger for testing phone alerts."""
     with state.lock:
         state.mode = "silent_night"
         state.last_sensor_name = "Test Sensor"
@@ -836,7 +863,6 @@ def service_page():
 
 @app.route("/api/service/status")
 def api_service_status():
-    import subprocess
     with state.lock:
         uptime = None
         if state.hub_connect_time:
@@ -849,7 +875,7 @@ def api_service_status():
             "last_health_check": state.last_health_check_time,
             "monitor_running": state._monitor_running,
             "monitor_mode": state.hub._monitor_mode if state.hub else "",
-            "monitor_rearming": state.hub._monitor_rearming if state.hub else False,
+            "siren_running": state._siren_running,
             "reconnect_in_progress": state._reconnect_in_progress,
             "ntfy_enabled": _ntfy_enabled,
         })
@@ -865,7 +891,6 @@ def api_service_reconnect():
 
 @app.route("/api/service/restart", methods=["POST"])
 def api_service_restart():
-    import subprocess
     try:
         subprocess.Popen(["sudo", "systemctl", "restart", "agshome"])
         return jsonify({"ok": True, "message": "Service restart initiated"})
@@ -886,7 +911,6 @@ def api_service_test_ntfy():
 
 @app.route("/api/service/logs")
 def api_service_logs():
-    import subprocess
     try:
         result = subprocess.run(
             ["sudo", "journalctl", "-u", "agshome", "-n", "30", "--no-pager", "--output=short"],
