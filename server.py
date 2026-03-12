@@ -22,7 +22,7 @@ import socket
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 from flask import Flask, jsonify, render_template, Response
@@ -81,10 +81,8 @@ class AppState:
         self.camera_connected = False
         self._monitor_running = False
         self._monitor_thread: Optional[threading.Thread] = None
-        self.reconnect_hour: int = 15
         self._reconnect_in_progress: bool = False
         self.hub_connect_time: Optional[datetime] = None
-        self.last_health_check_time: str = ""
         # Pi-owned siren state
         self._siren_running: bool = False
         self._abort_siren: bool = False
@@ -323,16 +321,11 @@ def _handle_trigger(current_mode: str, sensor_name: str = ""):
         logger.info("disarmed trigger: ntfy sent, no siren")
         return
 
-    # Silent modes: ntfy only, but clear the hub's triggered state after 10s
-    # to stop the flashing LED (hub runs DPS 103=True for 1 min otherwise)
+    # Silent modes: ntfy only — do not write any DPS.
+    # DPS 104 writes rotate the session key (same as DPS 101), causing 914 errors.
+    # The hub LED clears itself after ~1 min via its own timer — acceptable for silent mode.
     if current_mode in ("silent_night", "dog_door"):
-        logger.info(f"{current_mode} trigger: ntfy sent, clearing hub in 10s")
-        def _clear_trigger():
-            time.sleep(10)
-            if state.hub:
-                state.hub.silence_siren()
-                logger.info(f"{current_mode}: hub trigger cleared after 10s")
-        threading.Thread(target=_clear_trigger, daemon=True).start()
+        logger.info(f"{current_mode} trigger: ntfy sent")
         return
 
     if current_mode == "night":
@@ -427,96 +420,62 @@ def _poll_loop():
 
     Poll frequency is adaptive:
     - silent_night / dog_door: every 10s (async push unreliable in muted modes)
-    - all other modes: every 30s (async push reliable; poll only for health)
+    - all other modes: every 30s (async push is reliable; poll is a safety net)
 
-    Uses a SEPARATE TinyTuya device instance so it doesn't interfere with
-    the receive() session in _monitor_loop().
-    Health check runs every 60s to lower hub load.
-
-    After each poll, if hub DPS 101 ≠ HOME, ensure_home_muted() is called
-    to restore the expected state (e.g. after hub power cycle).
+    Uses state.hub.status() directly — shares the hub's main connection so
+    the key is always current after any reconnect. A separate TinyTuya device
+    instance caused 914 cascades because its key went stale after silence_siren()
+    reconnected the main hub socket.
     """
-    import tinytuya as _tinytuya
-    health_check_interval = 60.0
     last_poll = 0.0
-    last_health_check = 0.0
     last_poll_triggered = False
-    poll_device = None
 
     while state._monitor_running:
         time.sleep(0.5)
 
         if not (state.hub and state.hub_connected):
-            poll_device = None
             continue
 
         now = time.time()
 
-        # Adaptive poll interval
         with state.lock:
             current_mode = state.mode
         poll_interval = 10.0 if current_mode in ("silent_night", "dog_door") else 30.0
 
-        # --- Lazy-create a dedicated poll device ---
-        if poll_device is None:
-            try:
-                poll_device = _tinytuya.Device(
-                    dev_id=state.hub.device_id,
-                    address=state.hub.ip_address,
-                    local_key=state.hub.local_key,
-                    version=state.hub.version,
-                )
-                poll_device.set_socketTimeout(3)
-                logger.info("Poll device connected")
-            except Exception as e:
-                logger.warning(f"Poll device init failed: {e}")
-                poll_device = None
+        if now - last_poll < poll_interval:
+            continue
+
+        last_poll = now
+        try:
+            dps = state.hub.status()
+            if "error" in dps:
+                if "914" in str(dps.get("error", "")):
+                    logger.warning("Poll: hub returned 914")
+                    with state.lock:
+                        state.hub_connected = False
+                    _trigger_reconnect()
                 continue
 
-        # --- Poll at adaptive interval ---
-        if now - last_poll >= poll_interval:
-            last_poll = now
-            try:
-                result = poll_device.status()
-                if isinstance(result, dict) and "dps" in result:
-                    dps = result["dps"]
+            # Restore HOME+MUTE if hub drifted (e.g. power cycle)
+            polled_mode = dps.get(DPS_ALARM_MODE)
+            if polled_mode is not None and polled_mode != AlarmMode.HOME.value:
+                logger.warning(f"Poll: hub DPS 101 = {polled_mode!r} (expected HOME) — restoring")
+                _reflect_remote_action(polled_mode)
+                if polled_mode != AlarmMode.DISARMED.value:
+                    state.hub.ensure_home_muted()
 
-                    # Restore HOME+MUTE if hub drifted (e.g. power cycle)
-                    polled_mode = dps.get(DPS_ALARM_MODE)
-                    if polled_mode is not None and polled_mode != AlarmMode.HOME.value:
-                        logger.warning(f"Poll: hub DPS 101 = {polled_mode!r} (expected HOME) — restoring")
-                        _reflect_remote_action(polled_mode)
-                        if polled_mode != AlarmMode.DISARMED.value:
-                            state.hub.ensure_home_muted()
+            # Trigger detection via DPS 103
+            triggered = bool(dps.get(DPS_ALARM_TRIGGERED, False))
+            if triggered and not last_poll_triggered:
+                raw_name = dps.get(DPS_SENSOR_EVENT)
+                sensor_name = decode_utf16_base64(raw_name) if raw_name else None
+                logger.info(f"Trigger poll: DPS 103=True, sensor={sensor_name!r} (mode: {current_mode})")
+                if state.hub.monitor_active:
+                    _handle_trigger(current_mode, sensor_name)
+            last_poll_triggered = triggered
 
-                    # Trigger detection via DPS 103
-                    triggered = bool(dps.get(DPS_ALARM_TRIGGERED, False))
-                    if triggered and not last_poll_triggered:
-                        with state.lock:
-                            current_mode = state.mode
-                        raw_name = dps.get(DPS_SENSOR_EVENT)
-                        sensor_name = decode_utf16_base64(raw_name) if raw_name else None
-                        logger.info(f"Trigger poll: DPS 103=True, sensor={sensor_name!r} (mode: {current_mode})")
-                        if state.hub and state.hub.monitor_active:
-                            _handle_trigger(current_mode, sensor_name)
-                    last_poll_triggered = triggered
-
-                elif isinstance(result, dict) and result.get("Err") == "914":
-                    logger.warning("Poll: hub returned 914")
-                    poll_device = None
-            except Exception as e:
-                logger.warning(f"Poll error: {e}")
-                poll_device = None
-
-        # --- Health check every 60s ---
-        if now - last_health_check >= health_check_interval:
-            last_health_check = now
-            state.last_health_check_time = datetime.now().strftime("%H:%M:%S")
-            if state.hub and not state.hub.health_check():
-                with state.lock:
-                    state.hub_connected = False
-                poll_device = None
-                _trigger_reconnect()
+        except Exception as e:
+            logger.warning(f"Poll error: {e}")
 
 
 def start_monitor_thread():
@@ -592,34 +551,15 @@ def _trigger_reconnect():
     threading.Thread(target=_do_reconnect, daemon=True).start()
 
 
-def _daily_reconnect_loop():
-    """Background thread: gracefully reconnect hub daily at state.reconnect_hour."""
-    while True:
-        now = datetime.now()
-        target = now.replace(hour=state.reconnect_hour, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        wait_secs = (target - now).total_seconds()
-        logger.info(f"Daily reconnect scheduled in {wait_secs/3600:.1f}h at {target.strftime('%H:%M')}")
-        time.sleep(wait_secs)
-
-        logger.info("Daily reconnect: starting graceful reconnect...")
-        send_ntfy("Daily hub reconnect starting", priority=1, tags="arrows_counterclockwise")
-        if state.hub:
-            state.hub.disconnect()
-        with state.lock:
-            state.hub_connected = False
-        time.sleep(15)  # Hub needs time to release TCP session before accepting new connection
-        success = connect_hub_with_retry(max_minutes=5)
-        if success:
-            logger.info("Daily reconnect: success")
-            send_ntfy("Hub reconnected successfully", priority=1, tags="white_check_mark")
-
-
 def start_reconnect_thread():
-    """Start the daily reconnect watchdog thread."""
-    t = threading.Thread(target=_daily_reconnect_loop, daemon=True)
-    t.start()
+    """No-op: daily reconnect removed.
+
+    Session key rotation is handled on-demand by silence_siren() (reconnects
+    immediately after every DPS 101 write) and by _set_dps() 914 retry logic.
+    A scheduled reconnect was actively harmful — it tore down working connections
+    and failed to re-establish them when the key had rotated.
+    """
+    pass
 
 
 def connect_hub():
@@ -632,8 +572,6 @@ def connect_hub():
         return
 
     state.hub = hub
-    state.reconnect_hour = config.get("hub", {}).get("reconnect_hour", 15)
-
     def _connect_bg():
         logger.info(f"Connecting to hub at {hub.ip_address}...")
         connect_hub_with_retry(max_minutes=5)
@@ -705,9 +643,15 @@ def api_disarm():
     _stop_siren_if_running()
     if state.hub and state.hub.monitor_active:
         state.hub.stop_monitor()
-    # silence_siren() does disarm/re-arm to stop a triggered hub, then mutes
     if state.hub:
-        state.hub.silence_siren()
+        # Only use silence_siren() (DISARMED→HOME) if hub is actively triggered.
+        # Unconditional calls cause the Tuya app to see a HOME arm event every disarm.
+        hub_status = state.hub.status()
+        if hub_status.get(DPS_ALARM_TRIGGERED):
+            state.hub.silence_siren()
+        else:
+            # Not triggered — just ensure volume is muted, no DPS 101 write needed
+            state.hub._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
     with state.lock:
         state.mode = "disarmed"
     send_ntfy("Alarm disarmed", tags="unlock")
@@ -898,7 +842,6 @@ def api_service_status():
             "hub_connected": state.hub_connected,
             "hub_ip": state.hub.ip_address if state.hub else None,
             "hub_uptime": uptime,
-            "last_health_check": state.last_health_check_time,
             "monitor_running": state._monitor_running,
             "monitor_mode": state.hub._monitor_mode if state.hub else "",
             "siren_running": state._siren_running,
