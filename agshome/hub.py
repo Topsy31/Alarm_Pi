@@ -83,9 +83,12 @@ class AGSHomeHub:
             return True
 
         logger.info("Configured IP failed, scanning network for hub...")
-        discovered_ip = self._discover_device()
-        if discovered_ip and discovered_ip != self.ip_address:
-            logger.info(f"Hub discovered at new IP: {discovered_ip}")
+        discovered_ip, discovered_key = self._discover_device()
+        if discovered_ip:
+            # Apply rotated key if discovery returned one
+            if discovered_key and discovered_key != self.local_key:
+                logger.info("Applying rotated local key from discovery")
+                self.local_key = discovered_key
             if self._try_connect(discovered_ip):
                 self.ip_address = discovered_ip
                 return True
@@ -118,20 +121,27 @@ class AGSHomeHub:
             logger.warning(f"Connection to {ip} failed: {e}")
             return False
 
-    def _discover_device(self) -> Optional[str]:
-        """Scan the local network for the hub by device ID via UDP broadcast."""
+    def _discover_device(self) -> tuple[Optional[str], Optional[str]]:
+        """
+        Scan the local network for the hub by device ID via UDP broadcast.
+
+        Returns (ip, local_key) if found — local_key may be None if not in scan data.
+        914 errors mean the key has rotated; discovery includes the new key.
+        """
         try:
             logger.info("Running TinyTuya UDP discovery...")
             devices = tinytuya.deviceScan(verbose=False, maxretry=15)
             for ip, info in devices.items():
                 if info.get("gwId") == self.device_id:
-                    logger.info(f"Found hub: {ip} (version {info.get('version', '?')})")
-                    return ip
+                    new_key = info.get("key")
+                    logger.info(f"Found hub: {ip} (version {info.get('version', '?')})"
+                                + (f", key rotated" if new_key and new_key != self.local_key else ""))
+                    return ip, new_key
             logger.warning(f"Device {self.device_id} not found on network")
-            return None
+            return None, None
         except Exception as e:
             logger.error(f"Discovery failed: {e}")
-            return None
+            return None, None
 
     def disconnect(self):
         """Close the connection to the hub."""
@@ -280,6 +290,33 @@ class AGSHomeHub:
         """Silence the siren directly via DPS 104."""
         self._set_dps(DPS_SIREN, False)
         logger.info("Siren: OFF")
+
+    def silence_siren(self) -> None:
+        """
+        Force-stop the hub siren by briefly switching to DISARMED then back to HOME.
+
+        When the hub is in a triggered state (DPS 103=True), it ignores DPS 104
+        and DPS 107 writes. The only reliable way to silence it is to write DPS 101
+        to DISARMED ("2"), which immediately stops the siren, then restore HOME ("3").
+
+        WARNING: writing DPS 101 causes the Tuya hub to rotate its local session key.
+        We immediately reconnect afterwards to re-establish the session with the new key.
+        Volume is also restored to MUTE after silencing.
+        """
+        logger.info("Silence siren: DISARM hub to stop triggered siren...")
+        self._set_dps(DPS_ALARM_MODE, AlarmMode.DISARMED.value)
+        time.sleep(0.5)
+        self._set_dps(DPS_ALARM_MODE, AlarmMode.HOME.value)
+        time.sleep(1.0)
+        # Key has rotated — reconnect immediately to re-establish session
+        logger.info("Silence siren: reconnecting to refresh session key...")
+        self.disconnect()
+        time.sleep(2.0)
+        if self.connect():
+            self._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
+            logger.info("Silence siren: hub restored to HOME+MUTE, session refreshed")
+        else:
+            logger.warning("Silence siren: reconnect failed — hub may need manual restart")
 
     def set_night_light(self, on: bool) -> bool:
         """Turn the night light on or off (DPS 104)."""

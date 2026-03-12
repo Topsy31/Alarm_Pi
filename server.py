@@ -240,21 +240,25 @@ def _stop_siren_if_running():
 
 def _run_night_siren():
     """
-    Fire siren for SIREN_DURATION seconds then silence.
-    Retriggerable after completion — siren_running is cleared on exit.
+    Run siren for SIREN_DURATION seconds then silence.
+
+    Volume is already HIGH (set at arm time). To cut the siren we use
+    silence_siren() which briefly disarms/re-arms the hub — the only
+    reliable way to stop a triggered hub siren. Volume is then restored
+    to HIGH so the next trigger will also sound (retriggerable).
     """
     state._siren_running = True
     state._abort_siren = False
     try:
-        if state.hub:
-            state.hub.siren_on()
         for _ in range(SIREN_DURATION):
             if state._abort_siren:
                 logger.info("Night siren: aborted by disarm")
-                break
+                return
             time.sleep(1)
         if state.hub:
-            state.hub.siren_off()
+            state.hub.silence_siren()
+            state.hub._set_dps(DPS_VOLUME, VolumeLevel.HIGH.value)
+            logger.info("Night siren: silenced after %ds — volume HIGH, ready for retrigger", SIREN_DURATION)
     except Exception as e:
         logger.error(f"Night siren error: {e}")
     finally:
@@ -264,17 +268,18 @@ def _run_night_siren():
 
 def _run_away_siren():
     """
-    Fire siren indefinitely until _abort_siren is set (by disarm).
+    Run siren indefinitely until _abort_siren is set (by disarm).
+
+    Volume is already HIGH (set at arm time). Siren is cut by muting
+    volume — disarm restores MUTE permanently.
     """
     state._siren_running = True
     state._abort_siren = False
     try:
-        if state.hub:
-            state.hub.siren_on()
         while not state._abort_siren:
             time.sleep(1)
-        if state.hub:
-            state.hub.siren_off()
+        logger.info("Away siren: aborted by disarm")
+        # Disarm will restore MUTE — nothing to do here
     except Exception as e:
         logger.error(f"Away siren error: {e}")
     finally:
@@ -313,9 +318,21 @@ def _handle_trigger(current_mode: str, sensor_name: str = ""):
     send_ntfy(ntfy_body, title="Alarm Triggered",
               priority=_ntfy_priority_alert, tags="rotating_light,warning")
 
-    # Modes that only send ntfy — no siren
-    if current_mode in ("disarmed", "silent_night", "dog_door"):
-        logger.info(f"{current_mode} trigger: ntfy sent, no siren")
+    # Disarmed: nothing more to do
+    if current_mode == "disarmed":
+        logger.info("disarmed trigger: ntfy sent, no siren")
+        return
+
+    # Silent modes: ntfy only, but clear the hub's triggered state after 10s
+    # to stop the flashing LED (hub runs DPS 103=True for 1 min otherwise)
+    if current_mode in ("silent_night", "dog_door"):
+        logger.info(f"{current_mode} trigger: ntfy sent, clearing hub in 10s")
+        def _clear_trigger():
+            time.sleep(10)
+            if state.hub:
+                state.hub.silence_siren()
+                logger.info(f"{current_mode}: hub trigger cleared after 10s")
+        threading.Thread(target=_clear_trigger, daemon=True).start()
         return
 
     if current_mode == "night":
@@ -565,7 +582,7 @@ def _trigger_reconnect():
         )
         if state.hub:
             state.hub.disconnect()
-        time.sleep(3)
+        time.sleep(15)  # Hub needs time to release TCP session
         success = connect_hub_with_retry(max_minutes=5)
         if success:
             logger.info("Mid-session recovery: hub reconnected")
@@ -592,7 +609,7 @@ def _daily_reconnect_loop():
             state.hub.disconnect()
         with state.lock:
             state.hub_connected = False
-        time.sleep(3)
+        time.sleep(15)  # Hub needs time to release TCP session before accepting new connection
         success = connect_hub_with_retry(max_minutes=5)
         if success:
             logger.info("Daily reconnect: success")
@@ -688,6 +705,9 @@ def api_disarm():
     _stop_siren_if_running()
     if state.hub and state.hub.monitor_active:
         state.hub.stop_monitor()
+    # silence_siren() does disarm/re-arm to stop a triggered hub, then mutes
+    if state.hub:
+        state.hub.silence_siren()
     with state.lock:
         state.mode = "disarmed"
     send_ntfy("Alarm disarmed", tags="unlock")
@@ -699,7 +719,9 @@ def api_away():
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
     _stop_siren_if_running()
+    # Set volume HIGH now — before any trigger fires
     if state.hub:
+        state.hub._set_dps(DPS_VOLUME, VolumeLevel.HIGH.value)
         state.hub.start_monitor(mode="away")
     with state.lock:
         state.mode = "away"
@@ -712,7 +734,9 @@ def api_night():
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
     _stop_siren_if_running()
+    # Set volume HIGH now — before any trigger fires
     if state.hub:
+        state.hub._set_dps(DPS_VOLUME, VolumeLevel.HIGH.value)
         state.hub.start_monitor(mode="night")
     with state.lock:
         state.mode = "night"
@@ -725,7 +749,9 @@ def api_silent_night():
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
     _stop_siren_if_running()
+    # Ensure MUTE before entering silent mode
     if state.hub:
+        state.hub._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
         state.hub.start_monitor(mode="silent_night")
     with state.lock:
         state.mode = "silent_night"
@@ -750,9 +776,10 @@ def api_suspend():
         state.mode = "dog_door"
 
     if state.hub:
+        state.hub._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
         state.hub._monitor_mode = "dog_door"
 
-    logger.info("Dog door: active (ntfy-only mode)")
+    logger.info("Dog door: active (volume muted, ntfy-only mode)")
     send_ntfy("Dog door — alarm muted", tags="dog")
     return jsonify({"ok": True, "mode": "dog_door"})
 
@@ -760,9 +787,7 @@ def api_suspend():
 @app.route("/api/suspend/cancel", methods=["POST"])
 def api_suspend_cancel():
     """
-    Cancel Dog Door: restore Night mode.
-
-    Hub stays in HOME+MUTE unchanged — just update Pi state.
+    Cancel Dog Door: restore Night mode and volume.
     """
     if not state.hub_connected:
         return jsonify({"error": "Hub not connected"}), 503
@@ -772,9 +797,10 @@ def api_suspend_cancel():
         state.mode = "night"
 
     if state.hub:
+        state.hub._set_dps(DPS_VOLUME, VolumeLevel.HIGH.value)
         state.hub._monitor_mode = "night"
 
-    logger.info("Dog door cancelled — Night restored")
+    logger.info("Dog door cancelled — Night restored (volume HIGH)")
     send_ntfy("Dog door cancelled — Night restored", tags="lock")
     return jsonify({"ok": True, "mode": "night"})
 
