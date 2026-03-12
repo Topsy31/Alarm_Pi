@@ -5,14 +5,15 @@ Provides a high-level interface to the AGSHome security hub over the
 local network (Tuya encrypted protocol). No cloud dependency at runtime.
 
 Architecture (Pi-owned state machine):
-    The hub is kept in HOME + MUTE permanently after initial setup.
-    The Pi controls all alarm logic — the hub acts as a dumb peripheral
-    that fires sensor events (DPS 116) and receives siren commands (DPS 104).
+    The hub is kept in HOME + MUTE permanently. The Pi owns all alarm logic.
+    Every DPS write rotates the Tuya session key. silence_siren() handles
+    this by reconnecting immediately after the DISARMED→HOME cycle.
 
-    ensure_home_muted()  — call at startup and after reconnect (one write max)
-    siren_on()           — fire siren directly via DPS 104
-    siren_off()          — silence siren via DPS 104
-    set_night_light()    — toggle night light (also DPS 104)
+    ensure_home_muted()  — call at startup; writes DPS 101/107 only if needed,
+                           reconnects afterwards if DPS 101 was written
+    silence_siren()      — stop triggered siren via DISARMED→HOME + reconnect
+    siren_on/off()       — direct DPS 104 writes (night light / siren state)
+    set_night_light()    — toggle night light (DPS 104)
 """
 
 import logging
@@ -58,7 +59,6 @@ class AGSHomeHub:
         self.version = version
         self._device: Optional[tinytuya.Device] = None
         self._device_lock = threading.Lock()  # serialise all socket access
-        self._listeners: list[Callable] = []
         self._last_status: dict = {}
 
         # Monitor state
@@ -157,13 +157,6 @@ class AGSHomeHub:
         """Check if we have an active device handle."""
         return self._device is not None
 
-    def reconnect(self) -> bool:
-        """Gracefully disconnect and reconnect. Returns True on success."""
-        logger.info("Hub: graceful reconnect starting...")
-        self.disconnect()
-        time.sleep(3)
-        return self.connect()
-
     # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
@@ -191,26 +184,6 @@ class AGSHomeHub:
         if "error" in dps:
             return [f"Error: {dps['error']}"]
         return [describe_dps(idx, val) for idx, val in sorted(dps.items())]
-
-    def health_check(self) -> bool:
-        """
-        Perform a status() poll to verify the hub is still responsive.
-
-        Returns True if healthy, False on 914 lockout or connection error.
-        Sets self._device = None on 914 so the monitor loop can detect it.
-        """
-        if not self._device:
-            return False
-        try:
-            with self._device_lock:
-                result = self._device.status()
-            if isinstance(result, dict) and result.get("Err") == "914":
-                logger.warning("Health check: hub returned 914 — marking disconnected")
-                self._device = None
-                return False
-            return True
-        except Exception:
-            return False
 
     # ------------------------------------------------------------------ #
     # Low-level DPS write
@@ -258,8 +231,9 @@ class AGSHomeHub:
         """
         Set hub to HOME + MUTE if not already in that state.
 
-        Called at startup and after any reconnect. This is the only place
-        DPS 101 (mode) is written — one-time setup, never during normal operation.
+        Called at startup and after reconnect. Only writes DPS 101/107 if the
+        hub has drifted (e.g. after a power cycle). If DPS 101 is written,
+        reconnects immediately — every DPS 101 write rotates the session key.
         Returns True if already correct or successfully set.
         """
         status = self.status()
@@ -268,14 +242,18 @@ class AGSHomeHub:
             return False
         mode = status.get(DPS_ALARM_MODE)
         volume = status.get(DPS_VOLUME)
-        changed = False
+        mode_changed = False
         if mode != AlarmMode.HOME.value:
             self._set_dps(DPS_ALARM_MODE, AlarmMode.HOME.value)
-            changed = True
+            mode_changed = True
         if volume != VolumeLevel.MUTE.value:
             self._set_dps(DPS_VOLUME, VolumeLevel.MUTE.value)
-            changed = True
-        if changed:
+        if mode_changed:
+            logger.info("Hub: set to HOME+MUTE — reconnecting to refresh session key")
+            self.disconnect()
+            time.sleep(2)
+            return self.connect()
+        if mode_changed or volume != VolumeLevel.MUTE.value:
             logger.info("Hub: set to HOME+MUTE (one-time setup)")
         else:
             logger.info("Hub: already HOME+MUTE — no write needed")
@@ -431,37 +409,6 @@ class AGSHomeHub:
             pass
 
         return events
-
-    # ------------------------------------------------------------------ #
-    # Polling (legacy — used by dashboard)
-    # ------------------------------------------------------------------ #
-
-    def poll_once(self) -> dict:
-        """Poll the hub once and fire listeners for any changes."""
-        current = self.status()
-        if "error" in current:
-            return current
-        for idx, val in current.items():
-            old = self._last_status.get(idx)
-            if old is not None and old != val:
-                for listener in self._listeners:
-                    try:
-                        listener(idx, val, old)
-                    except Exception as e:
-                        logger.error(f"Listener error: {e}")
-        self._last_status = dict(current)
-        return current
-
-    def add_listener(self, callback: Callable[[str, Any, Any], None]):
-        """Register a callback for DPS changes: callback(dps_index, new_value, old_value)"""
-        self._listeners.append(callback)
-
-    def poll_loop(self, interval: float = 5.0):
-        """Blocking poll loop — queries hub at regular intervals."""
-        logger.info(f"Polling hub every {interval}s (Ctrl+C to stop)...")
-        while True:
-            self.poll_once()
-            time.sleep(interval)
 
     # ------------------------------------------------------------------ #
     # Utilities

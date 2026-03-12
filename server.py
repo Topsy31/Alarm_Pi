@@ -5,10 +5,12 @@ Serves a mobile-optimised HTML page and provides API endpoints
 for controlling the AGSHome alarm hub from a phone browser.
 
 Architecture (Pi-owned state machine):
-    The hub stays in HOME + MUTE permanently after startup.
-    The Pi owns all mode logic and fires/silences the siren directly
-    via DPS 104. No DPS 101 (mode) writes occur during normal operation,
-    eliminating the 914 session-rejection errors caused by frequent rearms.
+    The hub stays in HOME + MUTE permanently. The Pi owns all alarm logic.
+    DPS 101 (mode) is written only by silence_siren() to stop an active
+    triggered siren (DISARMED→HOME cycle). Every DPS write rotates the Tuya
+    session key — silence_siren() reconnects immediately afterwards.
+    The poll loop uses a dedicated TinyTuya device (separate socket from the
+    async receive loop) recreated fresh on each poll to avoid stale key issues.
 
 Usage:
     python server.py                 # Run standalone (for testing)
@@ -81,6 +83,7 @@ class AppState:
         self.camera_connected = False
         self._monitor_running = False
         self._monitor_thread: Optional[threading.Thread] = None
+        self._poll_thread: Optional[threading.Thread] = None
         self._reconnect_in_progress: bool = False
         self.hub_connect_time: Optional[datetime] = None
         # Pi-owned siren state
@@ -373,13 +376,16 @@ def _monitor_loop():
     """
     Background thread: receives async hub push events every 0.3s.
 
-    Uses receive() only — no status() calls here. status() sends a new
-    request on the same socket that receive() is listening on, which
-    corrupts the session. Polling for trigger detection is handled by
-    the separate _poll_loop() thread which uses its own connection.
+    Uses receive() only — no status() calls on this socket. status() sends a
+    new request on the same socket that receive() is listening on, which
+    corrupts the session. Polling uses a separate dedicated connection.
+
+    Only processes events when monitor_active — skips receive() entirely when
+    disarmed to avoid unnecessary socket traffic.
     """
     while state._monitor_running:
-        if state.hub and state.hub_connected and state.hub._device:
+        if (state.hub and state.hub_connected and state.hub._device
+                and state.hub.monitor_active):
             try:
                 events = state.hub.monitor_check_async()
                 for event in events:
@@ -390,15 +396,13 @@ def _monitor_loop():
                             current_mode = state.mode
                             state.last_sensor_name = sensor_name
                         logger.info(f"Sensor push: {sensor_name} (mode: {current_mode})")
-                        if state.hub.monitor_active:
-                            _handle_trigger(current_mode, sensor_name)
+                        _handle_trigger(current_mode, sensor_name)
 
                     elif event["type"] == "triggered" and event["message"] == "True":
                         with state.lock:
                             current_mode = state.mode
                         logger.info(f"Trigger push: DPS 103=True (mode: {current_mode})")
-                        if state.hub.monitor_active:
-                            _handle_trigger(current_mode)
+                        _handle_trigger(current_mode)
 
                     elif event["type"] == "mode":
                         _reflect_remote_action(event["message"])
@@ -415,18 +419,19 @@ def _monitor_loop():
 
 def _poll_loop():
     """
-    Background thread: polls hub status() to catch triggers and detect
+    Background thread: polls hub status to catch triggers and detect
     remote mode changes.
 
     Poll frequency is adaptive:
     - silent_night / dog_door: every 10s (async push unreliable in muted modes)
     - all other modes: every 30s (async push is reliable; poll is a safety net)
 
-    Uses state.hub.status() directly — shares the hub's main connection so
-    the key is always current after any reconnect. A separate TinyTuya device
-    instance caused 914 cascades because its key went stale after silence_siren()
-    reconnected the main hub socket.
+    Uses a dedicated TinyTuya device instance (separate socket from the
+    monitor loop's receive() socket — mixing them corrupts the session).
+    The poll device is recreated fresh on each poll using the current
+    state.hub.local_key, so it is always in sync after any reconnect.
     """
+    import tinytuya as _tinytuya
     last_poll = 0.0
     last_poll_triggered = False
 
@@ -447,14 +452,25 @@ def _poll_loop():
 
         last_poll = now
         try:
-            dps = state.hub.status()
-            if "error" in dps:
-                if "914" in str(dps.get("error", "")):
-                    logger.warning("Poll: hub returned 914")
+            # Fresh device each poll — always uses the current local_key
+            poll_device = _tinytuya.Device(
+                dev_id=state.hub.device_id,
+                address=state.hub.ip_address,
+                local_key=state.hub.local_key,
+                version=state.hub.version,
+            )
+            poll_device.set_socketTimeout(5)
+            result = poll_device.status()
+
+            if not isinstance(result, dict) or "dps" not in result:
+                if isinstance(result, dict) and result.get("Err") == "914":
+                    logger.warning("Poll: hub returned 914 — triggering reconnect")
                     with state.lock:
                         state.hub_connected = False
                     _trigger_reconnect()
                 continue
+
+            dps = result["dps"]
 
             # Restore HOME+MUTE if hub drifted (e.g. power cycle)
             polled_mode = dps.get(DPS_ALARM_MODE)
@@ -481,15 +497,20 @@ def _poll_loop():
 def start_monitor_thread():
     """Start the monitor and poll background threads."""
     state._monitor_running = True
-    threading.Thread(target=_monitor_loop, daemon=True).start()
-    threading.Thread(target=_poll_loop, daemon=True).start()
+    t1 = threading.Thread(target=_monitor_loop, daemon=True)
+    t2 = threading.Thread(target=_poll_loop, daemon=True)
+    state._monitor_thread = t1
+    state._poll_thread = t2
+    t1.start()
+    t2.start()
 
 
 def stop_monitor_thread():
     """Stop the background monitor threads."""
     state._monitor_running = False
-    if state._monitor_thread:
-        state._monitor_thread.join(timeout=2)
+    for t in (state._monitor_thread, state._poll_thread):
+        if t and t.is_alive():
+            t.join(timeout=2)
 
 
 # ============================================================
@@ -541,7 +562,7 @@ def _trigger_reconnect():
         )
         if state.hub:
             state.hub.disconnect()
-        time.sleep(15)  # Hub needs time to release TCP session
+        time.sleep(3)
         success = connect_hub_with_retry(max_minutes=5)
         if success:
             logger.info("Mid-session recovery: hub reconnected")
